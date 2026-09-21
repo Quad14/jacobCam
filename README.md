@@ -225,14 +225,23 @@ service runs as a low-privilege `LOCAL SERVICE` identity, not LocalSystem.
 From here on everything runs from Program Files, not from your build
 directory, so rebuilding does nothing until you re-run the script.
 
-The service takes **exclusive** ownership of the camera from here on, so
+The service **only opens the camera while an app is using it**. When an app
+starts reading frames, the service opens the camera, which takes a second or
+two, so the first frames are grey. Ten seconds after the last app stops, it
+closes the camera again. Plugged in and idle, the camera is not streaming
+anywhere.
+
+While an app has the camera, the service owns it **exclusively**, so
 `qcamctl probe`, `capture` and `stream` will report `Busy`. That is deliberate,
 not a limitation: opening the device runs the sensor init sequence, and a
 second process doing that to a live stream would corrupt it. Stop the service
 (`Stop-Service qcamsvc`) when you want to drive the hardware directly again.
 
-While it is running, use `attach` instead — it reads the service's
-shared-memory ring, exactly the way the virtual camera does:
+Only the Windows camera service may read the service's frames, so Windows'
+camera privacy settings and in-use indicator cover this camera the same as
+any other. To look at them yourself, use `attach` from an **elevated**
+prompt. It reads the service's shared-memory ring the way the virtual camera
+does, and asks the service to start the camera just as an app would:
 
 ```powershell
 .\qcamctl.exe attach -t 5

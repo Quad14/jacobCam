@@ -69,10 +69,17 @@ media source opened the device directly, then `qcamctl` could not run at the
 same time, and two applications opening the camera at once would fight over
 it.
 
-**The isochronous pipeline should be set up once.** Alternate-setting switches
+**The isochronous pipeline should not churn.** Alternate-setting switches
 and bandwidth reservation are not free, and this camera takes about 250 ms
-after enumeration before it will answer I2C at all. Doing that on every app
-launch would make the camera feel broken.
+after enumeration before it will answer I2C at all. The service opens the
+camera when the first reader asks and keeps it open until readers have been
+gone for ten seconds. An app restarting its pipeline, or a second app joining,
+reuses the running stream rather than re-running sensor init.
+
+It does *not* keep the camera open all the time. An open camera is a live
+feed into shared memory, and streaming only on demand means a plugged-in,
+unused camera is actually off. The cost is a second or two of grey frames when
+an app first opens it.
 
 **The Frame Server is not a good place to own hardware.** It loads the source
 into a shared, sandboxed service process. Keeping USB ownership, sensor

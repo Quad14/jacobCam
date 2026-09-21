@@ -127,9 +127,32 @@ identity under the `LOCAL SERVICE` account, with every privilege except
 LocalSystem and has no administrator rights, which is why the virtual camera
 is registered by the installer instead of by the service.
 
-The service SID is also what the frame ring's DACL grants write access to. The
-Frame Server runs as `LOCAL SERVICE` too, so granting the account would let
-the Frame Server write frames; granting the service SID does not.
+### Who can see the frames
+
+The frame ring is a live camera feed in shared memory. Windows' camera
+privacy settings and in-use indicator are enforced at the Frame Server, so
+anything that could read the ring directly would get around both. The ring's
+DACL therefore allows:
+
+| Who | Access |
+| --- | --- |
+| `NT SERVICE\qcamsvc` | write — the service |
+| `NT SERVICE\FrameServer` | read — hosts `qcamvcam.dll` |
+| SYSTEM, Administrators (elevated) | full — for `qcamctl attach` |
+
+Both services run as `LOCAL SERVICE`, which is why the grants name each
+service's own SID: granting the account would let the Frame Server write
+frames, and let every other `LOCAL SERVICE` process watch the camera.
+
+### Streaming on demand
+
+The service opens the camera only while something is reading frames. Each
+time the virtual camera or `qcamctl attach` opens the ring or waits for a
+frame, it signals the service's demand event
+(`Global\qcam.demand.4EA75BBB`, same DACL). On the first signal the service
+opens the camera and starts publishing. When no signal has arrived for ten
+seconds, it closes the camera again. An app therefore sees a second or two of
+grey frames at start while the sensor initialises.
 
 To run it in the foreground instead, which is how you debug it:
 
@@ -143,6 +166,7 @@ Useful options:
 ```
 --size WxH        published frame size (default 352x288)
 --vcam            console mode: register a temporary camera until Ctrl-C
+--always-on       console mode: stream whenever the camera is plugged in
 --name "TEXT"     friendly name shown in app camera pickers
 ```
 

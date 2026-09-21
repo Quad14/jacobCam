@@ -60,6 +60,8 @@ int Usage() {
         "  --size WxH          published frame size (default 352x288)\n"
         "  --vcam              console mode: also register a temporary camera\n"
         "                      that lasts until Ctrl-C (administrator)\n"
+        "  --always-on         console mode: stream whenever the camera is\n"
+        "                      plugged in, not only while an app reads frames\n"
         "  --name \"TEXT\"       friendly name shown in app camera pickers\n"
         "  -v, --verbose       verbose logging\n");
     return 2;
@@ -78,6 +80,7 @@ int wmain(int argc, wchar_t** argv) {
         if (arg == L"--console")        console = true;
         else if (arg == L"-v" || arg == L"--verbose") verbose = true;
         else if (arg == L"--vcam")      options.session_vcam = true;
+        else if (arg == L"--always-on") options.always_on = true;
         // Older install scripts passed this; the service no longer registers
         // a camera on its own, so it is accepted and ignored.
         else if (arg == L"--no-vcam")   {}

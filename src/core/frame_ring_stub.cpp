@@ -26,6 +26,14 @@ Status FrameRingWriter::Publish(const uint8_t*, size_t, uint64_t, uint64_t) {
     return Status::Unsupported;
 }
 
+struct FrameDemand::Impl {};
+
+FrameDemand::FrameDemand() = default;
+FrameDemand::~FrameDemand() = default;
+Status FrameDemand::Create() { return Status::Unsupported; }
+void FrameDemand::Close() {}
+void* FrameDemand::wait_handle() const { return nullptr; }
+
 FrameRingReader::FrameRingReader() = default;
 FrameRingReader::~FrameRingReader() = default;
 bool FrameRingReader::IsOpen() const { return false; }

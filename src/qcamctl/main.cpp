@@ -406,10 +406,22 @@ int CmdStream(const Args& args) {
 
 int CmdAttach(const Args& args) {
     FrameRingReader reader;
-    const Status st = reader.Open();
+    // The service only opens the camera once a reader asks, and opening it
+    // runs the sensor init sequence, so the ring may take a few seconds to
+    // appear. Each Open() attempt repeats the request.
+    Status st = reader.Open();
+    for (int i = 0; st == Status::NoDevice && i < 50; ++i) {
+        if (i == 0) std::printf("waiting for the service to start the camera...\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        st = reader.Open();
+    }
     if (Failed(st)) {
-        std::fprintf(stderr, "could not attach to the frame ring: %s\n"
-                             "(is the qcam service running?)\n", StatusName(st));
+        std::fprintf(stderr,
+                     "could not attach to the frame ring: %s\n"
+                     "  - is the qcam service running, and the camera plugged in?\n"
+                     "  - reading frames needs an elevated (administrator) prompt;\n"
+                     "    only the Windows camera service may read them otherwise\n",
+                     StatusName(st));
         return 1;
     }
 

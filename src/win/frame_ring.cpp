@@ -29,46 +29,39 @@ uint8_t* SlotAt(uint8_t* base, uint32_t slot_bytes, uint32_t index) {
     return base + sizeof(RingHeader) + SlotStride(slot_bytes) * index;
 }
 
-// The virtual camera source is loaded by the Windows Frame Server, which runs
-// as LOCAL SERVICE. A default DACL would grant access only to SYSTEM and to
-// Administrators, so the Frame Server could not open the ring at all and the
-// camera would enumerate but never produce a frame. These descriptors give
-// the writer full control and every plausible consumer read access.
+// Who may touch the ring and its events. The frames are a live camera feed,
+// so this is the camera's privacy boundary: Windows' own camera privacy
+// settings and in-use indicator apply at the Frame Server, and anything else
+// that could read the ring directly would bypass both. So:
 //
-// qcamsvc itself also runs as LOCAL SERVICE, so granting that account write
-// access would hand it to the Frame Server too. The writer is identified by
-// its per-service SID instead (see WriterAce below).
+//   SYSTEM, Administrators   full (elevated qcamctl attach, debugging)
+//   NT SERVICE\qcamsvc       full; the writer
+//   NT SERVICE\FrameServer   read; hosts qcamvcam.dll and so the only
+//                            ordinary consumer
+//
+// Both services run as LOCAL SERVICE, so granting that account would hand
+// the writer's rights to the Frame Server and let every other LOCAL SERVICE
+// process read the camera. The per-service SIDs tell them apart.
 //
 // Sections: GENERIC_READ already implies SECTION_MAP_READ.
-constexpr wchar_t kSectionSddl[] =
-    L"D:P"
-    L"(A;;GA;;;SY)"          // LocalSystem: full
-    L"(A;;GA;;;BA)"          // Administrators: full
-    L"(A;;GR;;;LS)"          // LOCAL SERVICE (Frame Server): read
-    L"(A;;GR;;;NS)"          // NETWORK SERVICE: read
-    L"(A;;GR;;;IU)";         // interactive users (qcamctl): read
-
 // Events: GENERIC_READ does not include SYNCHRONIZE, so readers need it
-// spelled out (0x00100000) or WaitForSingleObject fails with access denied.
-constexpr wchar_t kEventSddl[] =
-    L"D:P"
-    L"(A;;0x1F0003;;;SY)"    // EVENT_ALL_ACCESS
-    L"(A;;0x1F0003;;;BA)"
-    L"(A;;0x00100002;;;LS)"  // SYNCHRONIZE | EVENT_MODIFY_STATE
-    L"(A;;0x00100002;;;NS)"
-    L"(A;;0x00100002;;;IU)";
+// spelled out, and EVENT_MODIFY_STATE to reset the frame event and to signal
+// the demand event.
+constexpr wchar_t kSectionAll[]  = L"GA";
+constexpr wchar_t kSectionRead[] = L"GR";
+constexpr wchar_t kEventAll[]    = L"0x1F0003";    // EVENT_ALL_ACCESS
+constexpr wchar_t kEventRead[]   = L"0x00100002";  // SYNCHRONIZE | EVENT_MODIFY_STATE
 
-// An ACE granting `rights` to the qcamsvc service SID, or an empty string when
-// the service is not installed (console mode from an elevated prompt, where
-// the Administrators ACE already covers the writer).
-std::wstring WriterAce(const wchar_t* rights) {
+// An ACE granting `rights` to a per-service SID, or an empty string when that
+// service does not exist on this machine.
+std::wstring ServiceAce(const wchar_t* account, const wchar_t* rights) {
     BYTE sid[SECURITY_MAX_SID_SIZE];
     DWORD sid_size = sizeof(sid);
     wchar_t domain[256];
     DWORD domain_size = static_cast<DWORD>(std::size(domain));
     SID_NAME_USE use;
-    if (!::LookupAccountNameW(nullptr, QCAM_SERVICE_ACCOUNT, sid, &sid_size,
-                              domain, &domain_size, &use)) {
+    if (!::LookupAccountNameW(nullptr, account, sid, &sid_size, domain,
+                              &domain_size, &use)) {
         return std::wstring();
     }
     wchar_t* text = nullptr;
@@ -76,6 +69,22 @@ std::wstring WriterAce(const wchar_t* rights) {
     std::wstring ace = std::wstring(L"(A;;") + rights + L";;;" + text + L")";
     ::LocalFree(text);
     return ace;
+}
+
+std::wstring BuildSddl(const wchar_t* all, const wchar_t* read) {
+    std::wstring sddl = std::wstring(L"D:P(A;;") + all + L";;;SY)(A;;" + all + L";;;BA)";
+    // Missing when qcamsvc is not installed (console mode from an elevated
+    // prompt), where the Administrators ACE already covers the writer.
+    sddl += ServiceAce(QCAM_SERVICE_ACCOUNT, all);
+    std::wstring reader = ServiceAce(QCAM_READER_ACCOUNT, read);
+    if (reader.empty()) {
+        // No Frame Server service on this build of Windows: fall back to the
+        // account it would run as, so the camera works rather than failing
+        // closed on a machine that has no system camera stack to protect.
+        QCAM_LOGW("NT SERVICE\\FrameServer not found; granting LOCAL SERVICE read");
+        reader = std::wstring(L"(A;;") + read + L";;;LS)";
+    }
+    return sddl + reader;
 }
 
 // Owns the descriptor allocated by the SDDL converter.
@@ -158,7 +167,7 @@ Status FrameRingWriter::Create(const RingConfig& config) {
 
     const size_t total = sizeof(RingHeader) + SlotStride(slot_bytes) * kRingSlots;
 
-    const std::wstring section_sddl = kSectionSddl + WriterAce(L"GA");
+    const std::wstring section_sddl = BuildSddl(kSectionAll, kSectionRead);
     ScopedSecurityAttributes section_sa(section_sddl.c_str());
     impl_->mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, section_sa.get(),
                                           PAGE_READWRITE, 0,
@@ -179,7 +188,7 @@ Status FrameRingWriter::Create(const RingConfig& config) {
         return Status::Io;
     }
 
-    const std::wstring event_sddl = kEventSddl + WriterAce(L"0x1F0003");
+    const std::wstring event_sddl = BuildSddl(kEventAll, kEventRead);
     ScopedSecurityAttributes event_sa(event_sddl.c_str());
     // Manual reset, so a frame published while every reader was busy is not
     // missed by the next waiter.
@@ -263,24 +272,74 @@ Status FrameRingWriter::Publish(const uint8_t* data, size_t size,
 }
 
 // ---------------------------------------------------------------------------
+// Demand
+// ---------------------------------------------------------------------------
+
+struct FrameDemand::Impl {
+    HANDLE event = nullptr;
+    ~Impl() { if (event) ::CloseHandle(event); }
+};
+
+FrameDemand::FrameDemand() : impl_(new Impl()) {}
+FrameDemand::~FrameDemand() = default;
+
+Status FrameDemand::Create() {
+    Close();
+    const std::wstring sddl = BuildSddl(kEventAll, kEventRead);
+    ScopedSecurityAttributes sa(sddl.c_str());
+    // Auto-reset: the service consumes each signal as it checks for one, so a
+    // signal always means "someone asked since you last looked".
+    impl_->event = ::CreateEventW(sa.get(), /*manual=*/FALSE, FALSE,
+                                  QCAM_DEMAND_EVENT);
+    if (!impl_->event) {
+        QCAM_LOGE("CreateEvent (demand) failed: %lu", ::GetLastError());
+        return Status::Io;
+    }
+    return Status::Ok;
+}
+
+void FrameDemand::Close() {
+    if (impl_->event) {
+        ::CloseHandle(impl_->event);
+        impl_->event = nullptr;
+    }
+}
+
+void* FrameDemand::wait_handle() const { return impl_->event; }
+
+// ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
 struct FrameRingReader::Impl {
     HANDLE            mapping = nullptr;
     HANDLE            event   = nullptr;
+    HANDLE            demand  = nullptr;   // outlives Close(); see SignalDemand
     uint8_t*          view    = nullptr;
     const RingHeader* header  = nullptr;
     uint32_t          slot_bytes = 0;
     uint64_t          last_sequence = 0;
 
-    ~Impl() { Close(); }
+    ~Impl() {
+        Close();
+        if (demand) ::CloseHandle(demand);
+    }
 
     void Close() {
         if (event)   { ::CloseHandle(event);   event = nullptr; }
         if (view)    { ::UnmapViewOfFile(view); view = nullptr; }
         if (mapping) { ::CloseHandle(mapping); mapping = nullptr; }
         header = nullptr;
+    }
+
+    // Tells the service a reader wants frames. Called before the ring exists
+    // (that is how the service learns to open the camera) and on every read
+    // (that is how it learns to keep it open). Best effort: an older service,
+    // or none at all, simply has no demand event to find.
+    void SignalDemand() {
+        if (!demand)
+            demand = ::OpenEventW(EVENT_MODIFY_STATE, FALSE, QCAM_DEMAND_EVENT);
+        if (demand) ::SetEvent(demand);
     }
 };
 
@@ -291,8 +350,14 @@ bool FrameRingReader::IsOpen() const { return impl_ && impl_->header != nullptr;
 
 Status FrameRingReader::Open() {
     Close();
+    impl_->SignalDemand();
 
     impl_->mapping = ::OpenFileMappingW(FILE_MAP_READ, FALSE, QCAM_RING_NAME);
+    if (!impl_->mapping && ::GetLastError() == ERROR_ACCESS_DENIED) {
+        // Present, but only the Frame Server and administrators may read it.
+        QCAM_LOGD("frame ring access denied (not elevated?)");
+        return Status::Busy;
+    }
     if (!impl_->mapping) {
         // The service is not running, which is the common case rather than an
         // error: the virtual camera just has nothing to show yet.
@@ -376,6 +441,7 @@ Status FrameRingReader::Read(std::vector<uint8_t>* out, FrameMeta* meta,
                              uint32_t timeout_ms) {
     if (!out || !meta) return Status::InvalidArg;
     if (!IsOpen()) return Status::NoDevice;
+    impl_->SignalDemand();
 
     const DWORD deadline = ::GetTickCount() + timeout_ms;
     for (;;) {

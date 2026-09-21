@@ -21,6 +21,15 @@ constexpr wchar_t kServiceDisplay[] = L"qcam QuickCam Express frame broker";
 // How long to wait before looking for the camera again when it is absent.
 constexpr DWORD kRetryDelayMs = 3000;
 
+// How often a streaming service checks for an unplugged camera and for
+// readers having gone away.
+constexpr DWORD kStreamingPollMs = 1000;
+
+// How long the camera stays open after the last reader asked for a frame.
+// Long enough to ride out an app briefly pausing its pipeline (switching
+// resolution, a call being put on hold) without re-running sensor init.
+constexpr ULONGLONG kIdleTimeoutMs = 10000;
+
 SERVICE_STATUS         g_status = {};
 SERVICE_STATUS_HANDLE  g_status_handle = nullptr;
 CameraService*         g_service = nullptr;
@@ -92,6 +101,12 @@ void CameraService::PublishFrame(const DecodedFrame& frame) {
     }
 }
 
+void CameraService::ReleaseCamera() {
+    camera_.Close();
+    ring_.Close();   // readers see writer_alive drop and let go of the ring
+    published_ = 0;
+}
+
 Status CameraService::OpenAndStream(const ServiceOptions& options) {
     CameraConfig cfg;
     cfg.format     = options.format;
@@ -160,9 +175,40 @@ Status CameraService::Run(const ServiceOptions& options) {
         }
     }
 
+    // Stream only while something is reading. An open camera is a live feed
+    // into shared memory, so it should not be on just because it is plugged
+    // in. Readers signal the demand event on every read; see FrameDemand.
+    HANDLE demand = nullptr;
+    if (!options.always_on && stop_event_) {
+        if (Succeeded(demand_.Create()))
+            demand = static_cast<HANDLE>(demand_.wait_handle());
+        else
+            QCAM_LOGW("no demand event; streaming whenever the camera is present");
+    }
+    if (demand) QCAM_LOGI("waiting for an app to ask for frames");
+
     bool streaming = false;
+    bool demanded_ever = false;
+    ULONGLONG last_demand = 0;
     while (!stop_.load()) {
-        if (!streaming) {
+        const bool wanted =
+            !demand ||
+            (demanded_ever && ::GetTickCount64() - last_demand < kIdleTimeoutMs);
+
+        if (streaming && !camera_.IsStreaming()) {
+            // The transport dropped the stream, which on this hardware almost
+            // always means the cable came out.
+            QCAM_LOGW("stream stopped unexpectedly; releasing the device");
+            ReleaseCamera();
+            streaming = false;
+        } else if (streaming && !wanted) {
+            QCAM_LOGI("no app has asked for frames in %lu s; releasing the camera",
+                      static_cast<unsigned long>(kIdleTimeoutMs / 1000));
+            ReleaseCamera();
+            streaming = false;
+        }
+
+        if (!streaming && wanted) {
             const Status st = OpenAndStream(options);
             if (Succeeded(st)) {
                 streaming = true;
@@ -171,27 +217,35 @@ Status CameraService::Run(const ServiceOptions& options) {
             } else {
                 QCAM_LOGE("could not start the camera: %s", StatusName(st));
             }
-        } else if (!camera_.IsStreaming()) {
-            // The transport dropped the stream, which on this hardware almost
-            // always means the cable came out.
-            QCAM_LOGW("stream stopped unexpectedly; releasing the device");
-            camera_.Close();
-            ring_.Close();
-            streaming = false;
-            published_ = 0;
         }
 
-        if (stop_event_) {
-            if (::WaitForSingleObject(stop_event_, kRetryDelayMs) == WAIT_OBJECT_0)
-                break;
+        // Idle: sleep until stopped or asked for frames. Otherwise wake every
+        // so often, to notice an unplugged camera or the idle timeout while
+        // streaming, or to retry a failed start. Demand is only polled in those
+        // cases: a reader signals it on every frame, and blocking on it would
+        // turn a failed start into a retry at the frame rate.
+        bool demanded = false;
+        if (demand && !streaming && !wanted) {
+            HANDLE handles[2] = {stop_event_, demand};
+            demanded = ::WaitForMultipleObjects(2, handles, FALSE, INFINITE) ==
+                       WAIT_OBJECT_0 + 1;
+        } else if (stop_event_) {
+            ::WaitForSingleObject(stop_event_, streaming ? kStreamingPollMs
+                                                         : kRetryDelayMs);
         } else {
             ::Sleep(kRetryDelayMs);
+        }
+        if (demand && !demanded)
+            demanded = ::WaitForSingleObject(demand, 0) == WAIT_OBJECT_0;
+        if (demanded) {
+            demanded_ever = true;
+            last_demand   = ::GetTickCount64();
         }
     }
 
     QCAM_LOGI("shutting down");
-    camera_.Close();
-    ring_.Close();
+    ReleaseCamera();
+    demand_.Close();
     vcam_.Stop();
     vcam_.Close();
     ::MFShutdown();

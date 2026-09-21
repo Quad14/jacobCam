@@ -96,7 +96,33 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Reader side; lives in the virtual camera and in qcamctl.
+// Service side of on-demand streaming. Readers signal it every time they open
+// the ring or wait for a frame, so the service can leave the camera closed
+// until something actually wants frames, and close it again once nothing has
+// asked for a while.
+class FrameDemand {
+public:
+    FrameDemand();
+    ~FrameDemand();
+
+    FrameDemand(const FrameDemand&) = delete;
+    FrameDemand& operator=(const FrameDemand&) = delete;
+
+    Status Create();
+    void   Close();
+
+    // The auto-reset event readers signal: a HANDLE on Windows, null
+    // elsewhere or before Create() succeeds.
+    void*  wait_handle() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Reader side; lives in the virtual camera and in qcamctl. Open() and Read()
+// both tell the service a reader wants frames (see FrameDemand), so Open()
+// failing with NoDevice may simply mean the camera is still starting.
 class FrameRingReader {
 public:
     FrameRingReader();
