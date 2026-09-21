@@ -1,0 +1,32 @@
+# Build output
+build/
+build-*/
+out/
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Driver signing artifacts: never commit a certificate or a private key.
+*.cer
+*.pfx
+*.pvk
+*.cat
+*.snk
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+CMakeSettings.json
+
+# Captures and diagnostics
+*.bayer
+*.bmp
+*.pcap
+*.etl
+qcam_*.png

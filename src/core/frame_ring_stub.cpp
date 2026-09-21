@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Non-Windows stand-in for the shared-memory frame ring, so qcamctl and the
+// core library build and link on a developer machine. The real implementation
+// is src/win/frame_ring.cpp.
+
+#include "qcam/ring.h"
+
+#include "qcam/log.h"
+
+namespace qcam {
+
+struct FrameRingWriter::Impl {};
+struct FrameRingReader::Impl {};
+
+FrameRingWriter::FrameRingWriter() = default;
+FrameRingWriter::~FrameRingWriter() = default;
+bool FrameRingWriter::IsOpen() const { return false; }
+
+Status FrameRingWriter::Create(const RingConfig&) {
+    QCAM_LOGE("the frame ring is only implemented on Windows");
+    return Status::Unsupported;
+}
+void FrameRingWriter::Close() {}
+Status FrameRingWriter::Publish(const uint8_t*, size_t, uint64_t, uint64_t) {
+    return Status::Unsupported;
+}
+
+FrameRingReader::FrameRingReader() = default;
+FrameRingReader::~FrameRingReader() = default;
+bool FrameRingReader::IsOpen() const { return false; }
+
+Status FrameRingReader::Open() {
+    QCAM_LOGE("the frame ring is only implemented on Windows");
+    return Status::Unsupported;
+}
+void FrameRingReader::Close() {}
+Status FrameRingReader::GetConfig(RingConfig*) const { return Status::Unsupported; }
+Status FrameRingReader::Read(std::vector<uint8_t>*, FrameMeta*, uint32_t) {
+    return Status::Unsupported;
+}
+
+}  // namespace qcam

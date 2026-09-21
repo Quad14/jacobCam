@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// qcamsvc - the frame broker.
+//
+// One process owns the USB device, because WinUSB hands out exclusive access
+// to the interface and because the isochronous pipeline should be set up once
+// rather than torn down every time an app opens the camera. Decoded frames go
+// into a shared-memory ring that the Media Foundation virtual camera (and
+// qcamctl) read from.
+
+#ifndef QCAM_SERVICE_H_
+#define QCAM_SERVICE_H_
+
+#include <windows.h>
+
+#include <atomic>
+#include <string>
+#include <thread>
+
+#include "qcam/device.h"
+#include "qcam/ring.h"
+#include "qcam/types.h"
+#include "qcam/vcam.h"
+
+namespace qcam {
+
+struct ServiceOptions {
+    PixelFormat format     = PixelFormat::Nv12;
+    uint16_t    out_width  = 352;   // CIF, centre-cropped from the native 360x296
+    uint16_t    out_height = 288;
+    bool        register_vcam = true;
+    bool        console = false;
+    std::wstring friendly_name = L"Logitech QuickCam Express (qcam)";
+};
+
+class CameraService {
+public:
+    CameraService();
+    ~CameraService();
+
+    // Runs until Stop() is called. Handles the camera not being plugged in
+    // yet, and reconnects if it is unplugged and plugged back in.
+    Status Run(const ServiceOptions& options);
+    void   Stop();
+
+private:
+    Status OpenAndStream(const ServiceOptions& options);
+    void   PublishFrame(const DecodedFrame& frame);
+
+    Camera            camera_;
+    FrameRingWriter   ring_;
+    VirtualCamera     vcam_;
+    std::atomic<bool> stop_{false};
+    HANDLE            stop_event_ = nullptr;
+    uint64_t          published_  = 0;
+};
+
+// Service control plumbing.
+Status InstallService(const std::wstring& exe_path);
+Status UninstallService();
+int    RunAsService();
+
+}  // namespace qcam
+
+#endif  // QCAM_SERVICE_H_

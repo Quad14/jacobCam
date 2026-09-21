@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The portable core is where the protocol logic lives, so this is the job
+  # that actually proves something. It needs no Windows and no camera.
+  core-tests:
+    name: Core tests (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ./build/qcam_tests
+
+      - name: End-to-end self test against the mock device
+        run: ./build/qcamctl selftest
+
+  sanitizers:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQCAM_ASAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # The demosaic samples neighbouring pixels and clamps at the frame
+      # edges; that is the code most likely to walk off a buffer.
+      - name: Test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ./build/qcam_tests
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }}
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo --parallel
+
+      # The runner has no camera, so only the hardware-independent paths can
+      # run. It still catches a broken build, which is the main risk for the
+      # Windows-only code.
+      - name: Core tests
+        if: matrix.arch == 'x64'
+        run: .\build\RelWithDebInfo\qcam_tests.exe
+
+      - name: Self test
+        if: matrix.arch == 'x64'
+        run: .\build\RelWithDebInfo\qcamctl.exe selftest
+
+      - name: Check the INF parses
+        run: |
+          $inf = "driver\qcamusb.inf"
+          if (-not (Test-Path $inf)) { throw "INF missing" }
+          # infverif ships with the WDK and is not on the runner; at minimum
+          # assert the sections the installer depends on are present.
+          $text = Get-Content $inf -Raw
+          foreach ($section in @('[Version]','[Manufacturer]','[USB_Install]','[USB_Install.Services]','[Strings]')) {
+            if ($text -notmatch [regex]::Escape($section)) { throw "INF is missing $section" }
+          }
+          if ($text -notmatch 'PnpLockdown\s*=\s*1') { throw "INF must set PnpLockdown=1" }
+          if ($text -notmatch 'VID_046D&PID_0840') { throw "INF does not bind the target camera" }
+          Write-Host "INF looks structurally sound"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qcam-${{ matrix.arch }}
+          path: |
+            build/RelWithDebInfo/qcamctl.exe
+            build/RelWithDebInfo/qcamsvc.exe
+            build/RelWithDebInfo/qcamvcam.dll
+            driver/qcamusb.inf
+          if-no-files-found: warn

@@ -1,0 +1,102 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+;
+; qcamusb.inf - binds the Logitech QuickCam Express family to the inbox
+; WinUSB driver so the user-mode qcam stack can talk to it.
+;
+; This package contains no kernel-mode code of its own. WinUSB.sys ships with
+; Windows and is already Microsoft-signed; all this INF does is name the
+; devices and hand them over, which is why the driver needs no kernel
+; debugging, no WHQL submission and cannot bugcheck the machine.
+;
+; The package still has to be signed to install on 64-bit Windows. See
+; docs/installing.md for both routes (test signing for development,
+; attestation signing through Partner Center for distribution).
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = qcamusb.cat
+DriverVer   = 09/21/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64,NTarm64,NTx86
+
+; ---------------------------------------------------------------------------
+; Devices
+; ---------------------------------------------------------------------------
+; PID 0840 is the camera this driver was written for: M/N V-UB2,
+; P/N 861037-0000, STV0600 bridge with an Agilent HDCS-1000 sensor.
+;
+; The rest of the STV06xx family is listed because the same user-mode stack
+; covers them once a sensor back end exists. Only the HDCS parts are
+; implemented today; the others will bind, probe, and report that their
+; sensor is unsupported rather than pretending to work.
+
+[Standard.NTamd64]
+%QuickCamExpress.DeviceDesc%     = USB_Install, USB\VID_046D&PID_0840
+%QuickCamWeb.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0850
+%DexxaWebCam.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0870
+%QuickCamMessenger.DeviceDesc%   = USB_Install, USB\VID_046D&PID_08F0
+%QuickCamCommunicate.DeviceDesc% = USB_Install, USB\VID_046D&PID_08F5
+%QuickCamMessenger2.DeviceDesc%  = USB_Install, USB\VID_046D&PID_08F6
+
+[Standard.NTarm64]
+%QuickCamExpress.DeviceDesc%     = USB_Install, USB\VID_046D&PID_0840
+%QuickCamWeb.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0850
+%DexxaWebCam.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0870
+%QuickCamMessenger.DeviceDesc%   = USB_Install, USB\VID_046D&PID_08F0
+%QuickCamCommunicate.DeviceDesc% = USB_Install, USB\VID_046D&PID_08F5
+%QuickCamMessenger2.DeviceDesc%  = USB_Install, USB\VID_046D&PID_08F6
+
+[Standard.NTx86]
+%QuickCamExpress.DeviceDesc%     = USB_Install, USB\VID_046D&PID_0840
+%QuickCamWeb.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0850
+%DexxaWebCam.DeviceDesc%         = USB_Install, USB\VID_046D&PID_0870
+%QuickCamMessenger.DeviceDesc%   = USB_Install, USB\VID_046D&PID_08F0
+%QuickCamCommunicate.DeviceDesc% = USB_Install, USB\VID_046D&PID_08F5
+%QuickCamMessenger2.DeviceDesc%  = USB_Install, USB\VID_046D&PID_08F6
+
+; ---------------------------------------------------------------------------
+; Installation
+; ---------------------------------------------------------------------------
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.Wdf]
+KmdfService = WINUSB, WinUsb_Install
+
+[WinUsb_Install]
+KmdfLibraryVersion = 1.11
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+; The device interface GUID the qcam user-mode stack enumerates on. It is
+; specific to this project; do not reuse it for unrelated hardware.
+HKR,,DeviceInterfaceGUIDs,0x00010000,"{B17CB711-B823-4C31-89EA-E0FC9DC46605}"
+; The camera draws 100 mA and has no remote wake; leaving selective suspend
+; off keeps the isochronous pipeline from being torn down between frames.
+HKR,,"DeviceIdleEnabled",0x00010001,0
+HKR,,"SystemWakeEnabled",0x00010001,0
+
+; ---------------------------------------------------------------------------
+; Strings
+; ---------------------------------------------------------------------------
+[Strings]
+ProviderName                    = "qcam project"
+ManufacturerName                = "Logitech (via qcam)"
+QuickCamExpress.DeviceDesc      = "Logitech QuickCam Express (qcam)"
+QuickCamWeb.DeviceDesc          = "Logitech QuickCam Web / LEGO Cam (qcam)"
+DexxaWebCam.DeviceDesc          = "Dexxa WebCam USB (qcam)"
+QuickCamMessenger.DeviceDesc    = "Logitech QuickCam Messenger (qcam)"
+QuickCamCommunicate.DeviceDesc  = "Logitech QuickCam Communicate (qcam)"
+QuickCamMessenger2.DeviceDesc   = "Logitech QuickCam Messenger rev 2 (qcam)"

@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "service.h"
+
+#include <windows.h>
+
+#include <mfapi.h>
+
+#include <chrono>
+#include <cstdio>
+#include <vector>
+
+#include "qcam/log.h"
+#include "qcam/usb.h"
+
+namespace qcam {
+namespace {
+
+constexpr wchar_t kServiceName[]    = L"qcamsvc";
+constexpr wchar_t kServiceDisplay[] = L"qcam QuickCam Express frame broker";
+
+// How long to wait before looking for the camera again when it is absent.
+constexpr DWORD kRetryDelayMs = 3000;
+
+SERVICE_STATUS         g_status = {};
+SERVICE_STATUS_HANDLE  g_status_handle = nullptr;
+CameraService*         g_service = nullptr;
+
+void ReportStatus(DWORD state, DWORD exit_code = NO_ERROR, DWORD wait_hint = 0) {
+    static DWORD checkpoint = 1;
+
+    g_status.dwCurrentState  = state;
+    g_status.dwWin32ExitCode = exit_code;
+    g_status.dwWaitHint      = wait_hint;
+    g_status.dwControlsAccepted =
+        (state == SERVICE_START_PENDING) ? 0 : SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    g_status.dwCheckPoint =
+        (state == SERVICE_RUNNING || state == SERVICE_STOPPED) ? 0 : checkpoint++;
+
+    if (g_status_handle) ::SetServiceStatus(g_status_handle, &g_status);
+}
+
+void WINAPI ServiceCtrlHandler(DWORD control) {
+    switch (control) {
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            ReportStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+            if (g_service) g_service->Stop();
+            break;
+        default:
+            break;
+    }
+}
+
+void LogToEventLogAndDebugger(LogLevel level, const char* msg) {
+    char line[1200];
+    std::snprintf(line, sizeof(line), "[qcam] %s\n", msg);
+    ::OutputDebugStringA(line);
+    if (level == LogLevel::Error) {
+        // Errors also go to stderr, which the console mode shows.
+        std::fprintf(stderr, "%s", line);
+    }
+}
+
+}  // namespace
+
+CameraService::CameraService() {
+    stop_event_ = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
+
+CameraService::~CameraService() {
+    if (stop_event_) ::CloseHandle(stop_event_);
+}
+
+void CameraService::Stop() {
+    stop_.store(true);
+    if (stop_event_) ::SetEvent(stop_event_);
+}
+
+void CameraService::PublishFrame(const DecodedFrame& frame) {
+    const Status st = ring_.Publish(frame.data, frame.size, frame.sequence,
+                                    frame.timestamp_100ns);
+    if (Failed(st)) {
+        QCAM_LOGW("publishing frame %llu failed: %s",
+                  static_cast<unsigned long long>(frame.sequence), StatusName(st));
+        return;
+    }
+    if (++published_ % 300 == 0) {
+        const CameraStats s = camera_.stats();
+        QCAM_LOGI("published %llu frames (%.2f fps, exposure %d, gain %d)",
+                  static_cast<unsigned long long>(published_), s.measured_fps,
+                  s.exposure, s.gain);
+    }
+}
+
+Status CameraService::OpenAndStream(const ServiceOptions& options) {
+    CameraConfig cfg;
+    cfg.format     = options.format;
+    cfg.out_width  = options.out_width;
+    cfg.out_height = options.out_height;
+
+    QCAM_TRY(camera_.OpenFirst(cfg));
+
+    RingConfig ring_config;
+    ring_config.width  = camera_.out_width();
+    ring_config.height = camera_.out_height();
+    ring_config.format = options.format;
+    // Advertise the rate the hardware can actually sustain rather than a
+    // round number an app would like to see. Media Foundation is happy with a
+    // fractional rate; apps that insist on 30 fps get repeated frames from
+    // the virtual camera instead of a lie told here.
+    ring_config.fps_numerator   = static_cast<uint32_t>(camera_.nominal_fps() * 100.0);
+    ring_config.fps_denominator = 100;
+
+    Status st = ring_.Create(ring_config);
+    if (Failed(st)) {
+        camera_.Close();
+        return st;
+    }
+
+    st = camera_.Start([this](const DecodedFrame& f) { PublishFrame(f); });
+    if (Failed(st)) {
+        ring_.Close();
+        camera_.Close();
+        return st;
+    }
+
+    QCAM_LOGI("streaming %ux%u %s at ~%.2f fps", camera_.out_width(),
+              camera_.out_height(), PixelFormatName(options.format),
+              camera_.nominal_fps());
+    return Status::Ok;
+}
+
+Status CameraService::Run(const ServiceOptions& options) {
+    stop_.store(false);
+    if (stop_event_) ::ResetEvent(stop_event_);
+
+    const HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(hr)) {
+        QCAM_LOGE("MFStartup failed: 0x%08lx", static_cast<unsigned long>(hr));
+        return Status::Io;
+    }
+
+    // Register the system-wide camera even before the device shows up, so it
+    // is present in app pickers and simply produces nothing until the camera
+    // is plugged in.
+    if (options.register_vcam) {
+        Status st = vcam_.Create(options.friendly_name, VCamLifetime::System);
+        if (Succeeded(st)) {
+            st = vcam_.Start();
+            if (Failed(st))
+                QCAM_LOGW("virtual camera did not start: %s", StatusName(st));
+        } else if (st == Status::Unsupported) {
+            QCAM_LOGW("continuing without a system camera; "
+                      "qcamctl can still capture from the device");
+        } else {
+            QCAM_LOGE("virtual camera registration failed: %s", StatusName(st));
+        }
+    }
+
+    bool streaming = false;
+    while (!stop_.load()) {
+        if (!streaming) {
+            const Status st = OpenAndStream(options);
+            if (Succeeded(st)) {
+                streaming = true;
+            } else if (st == Status::NoDevice) {
+                QCAM_LOGD("no camera present; retrying");
+            } else {
+                QCAM_LOGE("could not start the camera: %s", StatusName(st));
+            }
+        } else if (!camera_.IsStreaming()) {
+            // The transport dropped the stream, which on this hardware almost
+            // always means the cable came out.
+            QCAM_LOGW("stream stopped unexpectedly; releasing the device");
+            camera_.Close();
+            ring_.Close();
+            streaming = false;
+            published_ = 0;
+        }
+
+        if (stop_event_) {
+            if (::WaitForSingleObject(stop_event_, kRetryDelayMs) == WAIT_OBJECT_0)
+                break;
+        } else {
+            ::Sleep(kRetryDelayMs);
+        }
+    }
+
+    QCAM_LOGI("shutting down");
+    camera_.Close();
+    ring_.Close();
+    vcam_.Stop();
+    vcam_.Close();
+    ::MFShutdown();
+    return Status::Ok;
+}
+
+// ---------------------------------------------------------------------------
+// Service control manager plumbing
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void WINAPI ServiceMain(DWORD, LPWSTR*) {
+    g_status_handle = ::RegisterServiceCtrlHandlerW(kServiceName, ServiceCtrlHandler);
+    if (!g_status_handle) return;
+
+    g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    ReportStatus(SERVICE_START_PENDING, NO_ERROR, 10000);
+
+    SetLogSink(&LogToEventLogAndDebugger);
+    SetLogLevel(LogLevel::Info);
+
+    CameraService service;
+    g_service = &service;
+
+    ReportStatus(SERVICE_RUNNING);
+
+    ServiceOptions options;
+    options.console = false;
+    service.Run(options);
+
+    g_service = nullptr;
+    ReportStatus(SERVICE_STOPPED);
+}
+
+}  // namespace
+
+int RunAsService() {
+    SERVICE_TABLE_ENTRYW table[] = {
+        {const_cast<LPWSTR>(kServiceName), ServiceMain},
+        {nullptr, nullptr},
+    };
+    if (!::StartServiceCtrlDispatcherW(table)) {
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            std::fprintf(stderr,
+                         "qcamsvc is a Windows service.\n"
+                         "Run 'qcamsvc --console' to run it in this window, or\n"
+                         "'qcamsvc --install' (as administrator) to register it.\n");
+            return 2;
+        }
+        std::fprintf(stderr, "StartServiceCtrlDispatcher failed: %lu\n", err);
+        return 1;
+    }
+    return 0;
+}
+
+Status InstallService(const std::wstring& exe_path) {
+    SC_HANDLE manager = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    if (!manager) {
+        QCAM_LOGE("OpenSCManager failed: %lu (run as administrator)", ::GetLastError());
+        return Status::Busy;
+    }
+
+    // Quote the path so a space in Program Files does not split the command.
+    const std::wstring command = L"\"" + exe_path + L"\"";
+
+    SC_HANDLE service = ::CreateServiceW(
+        manager, kServiceName, kServiceDisplay, SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+        command.c_str(), nullptr, nullptr, nullptr,
+        // LocalSystem: it needs to create objects in the Global namespace and
+        // to open a device interface.
+        nullptr, nullptr);
+
+    if (!service) {
+        const DWORD err = ::GetLastError();
+        ::CloseServiceHandle(manager);
+        if (err == ERROR_SERVICE_EXISTS) {
+            QCAM_LOGI("service already installed");
+            return Status::Ok;
+        }
+        QCAM_LOGE("CreateService failed: %lu", err);
+        return Status::Io;
+    }
+
+    SERVICE_DESCRIPTIONW description = {
+        const_cast<LPWSTR>(L"Publishes frames from a Logitech QuickCam Express "
+                           L"to the Windows camera stack.")};
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
+
+    // Restart on failure rather than leaving the camera dead after a hiccup.
+    SC_ACTION actions[3] = {};
+    for (auto& action : actions) {
+        action.Type  = SC_ACTION_RESTART;
+        action.Delay = 10000;
+    }
+    SERVICE_FAILURE_ACTIONSW failure = {};
+    failure.dwResetPeriod = 86400;
+    failure.cActions      = 3;
+    failure.lpsaActions   = actions;
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+
+    ::CloseServiceHandle(service);
+    ::CloseServiceHandle(manager);
+    QCAM_LOGI("service installed");
+    return Status::Ok;
+}
+
+Status UninstallService() {
+    SC_HANDLE manager = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) {
+        QCAM_LOGE("OpenSCManager failed: %lu (run as administrator)", ::GetLastError());
+        return Status::Busy;
+    }
+
+    SC_HANDLE service = ::OpenServiceW(manager, kServiceName,
+                                       SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+    if (!service) {
+        ::CloseServiceHandle(manager);
+        QCAM_LOGI("service is not installed");
+        return Status::Ok;
+    }
+
+    SERVICE_STATUS status = {};
+    if (::ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+        // Give it a moment to come to rest before deleting the registration.
+        for (int i = 0; i < 50 && status.dwCurrentState != SERVICE_STOPPED; ++i) {
+            ::Sleep(100);
+            if (!::QueryServiceStatus(service, &status)) break;
+        }
+    }
+
+    const BOOL deleted = ::DeleteService(service);
+    ::CloseServiceHandle(service);
+    ::CloseServiceHandle(manager);
+
+    if (!deleted) {
+        QCAM_LOGE("DeleteService failed: %lu", ::GetLastError());
+        return Status::Io;
+    }
+    QCAM_LOGI("service uninstalled");
+    return Status::Ok;
+}
+
+}  // namespace qcam
