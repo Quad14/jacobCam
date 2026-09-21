@@ -64,9 +64,10 @@ Leaving the generator out is deliberate: CMake picks the newest Visual Studio
 it finds, so this keeps working as you upgrade. Pass
 `-G "Visual Studio 17 2022"` only if you need to pin a specific one.
 
-**Expect compile errors on this first build.** The portable core is known
-good; anything MSVC complains about will be in `src/win/`, `src/qcamsvc/` or
-`src/qcamvcam/`, which have only ever been compiled in my head.
+This should build clean — CI compiles x64 and ARM64 on every push — but it
+has only ever been built by CI, never by a person. If MSVC does complain,
+the portable core is the well-covered part; look in `src/win/`,
+`src/qcamsvc/` or `src/qcamvcam/` first.
 
 Once it builds, run the two checks that need no camera:
 
@@ -328,19 +329,24 @@ user-mode media source appear to every app as a real camera.
 
 Honest summary, because it matters for what you do next.
 
-**Verified here.** The portable core — bridge register encoding, the I2C
-staging format, HDCS-1000 probe/init/window/exposure/gain sequences, the
-isochronous chunk framer, demosaic, colour conversion, and the auto-exposure
-loop — is covered by 96 unit tests that pass, including under
-AddressSanitizer and UndefinedBehaviorSanitizer. `qcamctl selftest` drives the
-entire stack end to end against a mock transport and decodes a synthetic
+**Verified by CI.** Every push builds and tests on Linux (gcc and clang) and
+builds on Windows for both x64 and ARM64, with MSVC 14.51 (Visual Studio 18,
+Windows SDK 10.0.26100). The 96 unit tests and the end-to-end
+`qcamctl selftest` run on Linux *and* natively on Windows. The Linux job also
+runs everything under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+That covers bridge register encoding, the I2C staging format, HDCS-1000
+probe/init/window/exposure/gain sequences, the isochronous chunk framer,
+demosaic, colour conversion, and the auto-exposure loop. `qcamctl selftest`
+drives the whole stack against a mock transport and decodes a synthetic
 frame.
 
-**Not verified here, because it needs the hardware and a Windows machine.**
-The WinUSB transport, the INF binding, the service, and the Media Foundation
-virtual camera have never been compiled by MSVC or run. They were written
-against the documented APIs, and this environment is Linux with no camera
-attached. Expect to fix compile errors on the first Windows build.
+**Compiles, but has never been executed.** The WinUSB transport, the service,
+and the Media Foundation virtual camera build cleanly on MSVC, and that is
+all that can be said for them: no part of this has been run against the
+hardware, and `qcamvcam.dll` has never been loaded by the Frame Server. A
+clean compile says the API usage is type-correct, not that the runtime
+behaviour is right.
 
 **Known to need checking on real hardware.** The register sequences come from
 the documented STV06xx protocol rather than from a capture of *your* camera.

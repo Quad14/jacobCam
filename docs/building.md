@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | **Visual Studio 2022 or newer** | "Desktop development with C++" workload |
-| **Windows 11 SDK** | 10.0.22000 or later — `mfvirtualcamera.h` and `mfsensorgroup.lib` are not in older SDKs |
+| **Windows 11 SDK** | 10.0.22000 or later — `mfvirtualcamera.h` and `mfsensorgroup.lib` are not in older SDKs. CI builds against 10.0.26100 |
 | **CMake** | 3.20 or later (ships with Visual Studio) |
 
 No WDK is required. There is no kernel-mode code, and `qcamusb.inf` references
