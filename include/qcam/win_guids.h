@@ -32,5 +32,9 @@ DEFINE_GUID(CLSID_QcamActivator,
 #define QCAM_RING_MUTEX   L"Global\\qcam.lock.4EA75BBB"
 #define QCAM_CONTROL_PIPE L"\\\\.\\pipe\\qcam.control.4EA75BBB"
 
+// The per-service SID qcamsvc runs with. It is the only non-administrator
+// principal allowed to write the frame ring.
+#define QCAM_SERVICE_ACCOUNT L"NT SERVICE\\qcamsvc"
+
 #endif  // _WIN32
 #endif  // QCAM_WIN_GUIDS_H_

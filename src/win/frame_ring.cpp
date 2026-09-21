@@ -9,6 +9,8 @@
 #include <sddl.h>
 
 #include <cstring>
+#include <iterator>
+#include <string>
 
 #include "qcam/log.h"
 #include "qcam/win_guids.h"
@@ -31,7 +33,11 @@ uint8_t* SlotAt(uint8_t* base, uint32_t slot_bytes, uint32_t index) {
 // as LOCAL SERVICE. A default DACL would grant access only to SYSTEM and to
 // Administrators, so the Frame Server could not open the ring at all and the
 // camera would enumerate but never produce a frame. These descriptors give
-// the service full control and every plausible consumer read access.
+// the writer full control and every plausible consumer read access.
+//
+// qcamsvc itself also runs as LOCAL SERVICE, so granting that account write
+// access would hand it to the Frame Server too. The writer is identified by
+// its per-service SID instead (see WriterAce below).
 //
 // Sections: GENERIC_READ already implies SECTION_MAP_READ.
 constexpr wchar_t kSectionSddl[] =
@@ -51,6 +57,26 @@ constexpr wchar_t kEventSddl[] =
     L"(A;;0x00100002;;;LS)"  // SYNCHRONIZE | EVENT_MODIFY_STATE
     L"(A;;0x00100002;;;NS)"
     L"(A;;0x00100002;;;IU)";
+
+// An ACE granting `rights` to the qcamsvc service SID, or an empty string when
+// the service is not installed (console mode from an elevated prompt, where
+// the Administrators ACE already covers the writer).
+std::wstring WriterAce(const wchar_t* rights) {
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD sid_size = sizeof(sid);
+    wchar_t domain[256];
+    DWORD domain_size = static_cast<DWORD>(std::size(domain));
+    SID_NAME_USE use;
+    if (!::LookupAccountNameW(nullptr, QCAM_SERVICE_ACCOUNT, sid, &sid_size,
+                              domain, &domain_size, &use)) {
+        return std::wstring();
+    }
+    wchar_t* text = nullptr;
+    if (!::ConvertSidToStringSidW(sid, &text)) return std::wstring();
+    std::wstring ace = std::wstring(L"(A;;") + rights + L";;;" + text + L")";
+    ::LocalFree(text);
+    return ace;
+}
 
 // Owns the descriptor allocated by the SDDL converter.
 class ScopedSecurityAttributes {
@@ -132,7 +158,8 @@ Status FrameRingWriter::Create(const RingConfig& config) {
 
     const size_t total = sizeof(RingHeader) + SlotStride(slot_bytes) * kRingSlots;
 
-    ScopedSecurityAttributes section_sa(kSectionSddl);
+    const std::wstring section_sddl = kSectionSddl + WriterAce(L"GA");
+    ScopedSecurityAttributes section_sa(section_sddl.c_str());
     impl_->mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, section_sa.get(),
                                           PAGE_READWRITE, 0,
                                           static_cast<DWORD>(total),
@@ -152,7 +179,8 @@ Status FrameRingWriter::Create(const RingConfig& config) {
         return Status::Io;
     }
 
-    ScopedSecurityAttributes event_sa(kEventSddl);
+    const std::wstring event_sddl = kEventSddl + WriterAce(L"0x1F0003");
+    ScopedSecurityAttributes event_sa(event_sddl.c_str());
     // Manual reset, so a frame published while every reader was busy is not
     // missed by the next waiter.
     impl_->event = ::CreateEventW(event_sa.get(), /*manual=*/TRUE, FALSE,

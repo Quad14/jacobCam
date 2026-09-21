@@ -134,17 +134,20 @@ Status CameraService::Run(const ServiceOptions& options) {
     stop_.store(false);
     if (stop_event_) ::ResetEvent(stop_event_);
 
+    // The virtual camera (console --vcam) talks to the Frame Server over COM.
+    const bool com = SUCCEEDED(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+
     const HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) {
         QCAM_LOGE("MFStartup failed: 0x%08lx", static_cast<unsigned long>(hr));
+        if (com) ::CoUninitialize();
         return Status::Io;
     }
 
-    // Register the system-wide camera even before the device shows up, so it
-    // is present in app pickers and simply produces nothing until the camera
-    // is plugged in.
-    if (options.register_vcam) {
-        Status st = vcam_.Create(options.friendly_name, VCamLifetime::System);
+    // The installed camera is registered once by install.ps1 and outlives this
+    // process. This one is a debugging aid and disappears when we exit.
+    if (options.session_vcam) {
+        Status st = vcam_.Create(options.friendly_name, VCamLifetime::Session);
         if (Succeeded(st)) {
             st = vcam_.Start();
             if (Failed(st))
@@ -192,6 +195,7 @@ Status CameraService::Run(const ServiceOptions& options) {
     vcam_.Stop();
     vcam_.Close();
     ::MFShutdown();
+    if (com) ::CoUninitialize();
     return Status::Ok;
 }
 
@@ -256,24 +260,52 @@ Status InstallService(const std::wstring& exe_path) {
     // Quote the path so a space in Program Files does not split the command.
     const std::wstring command = L"\"" + exe_path + L"\"";
 
+    // LOCAL SERVICE rather than LocalSystem. All the service needs is to open
+    // the WinUSB device and create the Global\ frame ring, and neither takes
+    // more than an ordinary service account. The virtual camera registration,
+    // which does need administrator rights, is done once by install.ps1.
+    constexpr wchar_t kAccount[] = L"NT AUTHORITY\\LocalService";
+
     SC_HANDLE service = ::CreateServiceW(
         manager, kServiceName, kServiceDisplay, SERVICE_ALL_ACCESS,
         SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-        command.c_str(), nullptr, nullptr, nullptr,
-        // LocalSystem: it needs to create objects in the Global namespace and
-        // to open a device interface.
-        nullptr, nullptr);
+        command.c_str(), nullptr, nullptr, nullptr, kAccount, L"");
 
     if (!service) {
         const DWORD err = ::GetLastError();
-        ::CloseServiceHandle(manager);
-        if (err == ERROR_SERVICE_EXISTS) {
-            QCAM_LOGI("service already installed");
-            return Status::Ok;
+        if (err != ERROR_SERVICE_EXISTS) {
+            ::CloseServiceHandle(manager);
+            QCAM_LOGE("CreateService failed: %lu", err);
+            return Status::Io;
         }
-        QCAM_LOGE("CreateService failed: %lu", err);
-        return Status::Io;
+        // Already installed, perhaps by an older build that ran as
+        // LocalSystem from the build directory. Bring it up to date rather
+        // than leaving the old account and path in place.
+        service = ::OpenServiceW(manager, kServiceName, SERVICE_ALL_ACCESS);
+        if (!service ||
+            !::ChangeServiceConfigW(service, SERVICE_WIN32_OWN_PROCESS,
+                                    SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                                    command.c_str(), nullptr, nullptr, nullptr,
+                                    kAccount, L"", kServiceDisplay)) {
+            QCAM_LOGE("updating the existing service failed: %lu", ::GetLastError());
+            if (service) ::CloseServiceHandle(service);
+            ::CloseServiceHandle(manager);
+            return Status::Io;
+        }
+        QCAM_LOGI("service already installed; configuration updated");
     }
+
+    // Give the process its own SID (NT SERVICE\qcamsvc). The Frame Server also
+    // runs as LOCAL SERVICE, so the account alone cannot tell the frame ring's
+    // writer apart from its readers; the service SID can.
+    SERVICE_SID_INFO sid_info = {SERVICE_SID_TYPE_UNRESTRICTED};
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO, &sid_info);
+
+    // Strip every privilege the service does not use from its token.
+    wchar_t privileges[] = L"SeCreateGlobalPrivilege\0SeChangeNotifyPrivilege\0";
+    SERVICE_REQUIRED_PRIVILEGES_INFOW required = {privileges};
+    ::ChangeServiceConfig2W(service, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO,
+                            &required);
 
     SERVICE_DESCRIPTIONW description = {
         const_cast<LPWSTR>(L"Publishes frames from a Logitech QuickCam Express "

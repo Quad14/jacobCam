@@ -26,9 +26,11 @@ pnputil /enum-drivers | Select-String -Context 3 qcam
 Get-Content C:\Windows\INF\setupapi.dev.log -Tail 80
 ```
 
-`setupapi.dev.log` names the actual reason. A signature complaint means the
-package is unsigned and the machine is not in test-signing mode — see
-`docs/installing.md`.
+`setupapi.dev.log` names the actual reason. A signature complaint usually
+means the INF was installed from somewhere without its catalog — install the
+signed copy in `C:\Program Files\qcam\driver\`, or re-run `install.ps1`, which
+re-signs it. See `docs/installing.md`. Test-signing mode is not needed and
+will not help.
 
 ## 2. Does the sensor answer?
 

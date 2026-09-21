@@ -45,7 +45,7 @@ devices and hands them to WinUSB.
 ```
 ┌─────────────────────────────┐   ┌──────────────────────────────┐
 │ qcamsvc.exe                 │   │ Frame Server (LOCAL SERVICE) │
-│ LocalSystem                 │   │                              │
+│ NT SERVICE\qcamsvc          │   │                              │
 │                             │   │  ┌────────────────────────┐  │
 │  Camera                     │   │  │ qcamvcam.dll           │  │
 │   ├ WinUsbTransport ────────┼───┼─▶│  QcamMediaSource       │  │

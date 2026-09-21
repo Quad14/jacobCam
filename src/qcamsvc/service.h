@@ -28,7 +28,11 @@ struct ServiceOptions {
     PixelFormat format     = PixelFormat::Nv12;
     uint16_t    out_width  = 352;   // CIF, centre-cropped from the native 360x296
     uint16_t    out_height = 288;
-    bool        register_vcam = true;
+    // The installed service never registers a camera: that needs
+    // administrator rights, which it does not have, so install.ps1 registers
+    // a persistent one instead. This is for debugging in console mode from
+    // an elevated prompt, and lasts only as long as the process.
+    bool        session_vcam = false;
     bool        console = false;
     std::wstring friendly_name = L"Logitech QuickCam Express (qcam)";
 };
