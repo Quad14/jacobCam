@@ -20,6 +20,248 @@ The part number is decisive: `861037` appears verbatim in the STV06xx family's
 published hardware table as *"Sensor HDCS1000, ASIC STV0600"*. There is no
 guesswork about what is inside this particular camera.
 
+## Using it with the camera
+
+Read this first. The Windows half of this stack has never been compiled or run
+against hardware — see [State of the code](#state-of-the-code) — so bring it up
+in the order below and verify each layer before adding the next. Every step
+tells you what "working" looks like, so when something breaks you know which
+layer broke.
+
+Budget an hour for the first run, most of it in steps 2 and 3.
+
+### What you need
+
+- The camera, and a USB port **directly on the machine** — not a hub. It draws
+  100 mA and an unpowered hub with anything else on it can starve it.
+- **Windows 11**, build 22000 or later, for the camera to appear in apps.
+  Windows 10 works for everything except that last step; `MFCreateVirtualCamera`
+  is Win11-only.
+- **Visual Studio 2022** with "Desktop development with C++", and the
+  **Windows 11 SDK** (10.0.22000+). Older SDKs lack `mfvirtualcamera.h`.
+  No WDK needed to build.
+- An elevated PowerShell for steps 3 and 5.
+
+### 1. Check the label matches
+
+Look at the sticker on the cable. You want **`P/N: 861037-0000`**.
+
+That part number — not the model name — is what says an HDCS-1000 sensor sits
+behind the STV0600 bridge. Logitech shipped the *same* "QuickCam Express"
+with three different sensors over its life. If your part number differs, keep
+going anyway: step 4 reads the sensor's identity register and will tell you
+exactly what you have. See [`docs/hardware.md`](docs/hardware.md) for the full
+part-number table.
+
+### 2. Build, and prove the protocol stack before touching hardware
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config RelWithDebInfo
+```
+
+**Expect compile errors on this first build.** The portable core is known
+good; anything MSVC complains about will be in `src/win/`, `src/qcamsvc/` or
+`src/qcamvcam/`, which have only ever been compiled in my head.
+
+Once it builds, run the two checks that need no camera:
+
+```powershell
+.\build\RelWithDebInfo\qcam_tests.exe      # 96 tests
+.\build\RelWithDebInfo\qcamctl.exe selftest
+```
+
+Both should pass. This is the useful checkpoint: `selftest` drives the entire
+stack — bridge protocol, I2C, sensor init, chunk framing, demosaic — against a
+mock device and decodes a synthetic frame. If it passes, everything above the
+USB layer is intact, and any remaining problem is Windows plumbing or the
+hardware itself. That is a much smaller search space.
+
+> No Windows machine, or the camera isn't to hand? These two also run on Linux
+> and macOS: `cmake -S . -B build && cmake --build build && ./build/qcam_tests`.
+
+### 3. Bind the camera to WinUSB
+
+This is the step that stalls people, and it is about signing, not about this
+driver.
+
+`qcamusb.inf` contains no code — it just hands the device to the inbox WinUSB
+driver — but Windows still requires the **package** to be signed before it will
+install on 64-bit. For your own machine, test signing is the quick route:
+
+```powershell
+bcdedit /set testsigning on     # elevated; needs a reboot, and Secure Boot off
+```
+
+Then sign the package and install it. Full instructions, including the
+distribution route (attestation signing via Partner Center), are in
+[`docs/installing.md`](docs/installing.md).
+
+```powershell
+pnputil /add-driver driver\qcamusb.inf /install
+```
+
+**Working looks like:** in Device Manager, under **Universal Serial Bus
+devices**, an entry named *"Logitech QuickCam Express (qcam)"*.
+
+If it is still under **Other devices** with a yellow mark, the INF did not
+take. `Get-Content C:\Windows\INF\setupapi.dev.log -Tail 80` names the actual
+reason, and it is almost always the signature.
+
+### 4. Bring it up layer by layer with `qcamctl`
+
+**Do not install the service yet.** WinUSB access is exclusive — the service
+would take the device and `qcamctl` could not open it. Drive the camera
+directly first.
+
+```powershell
+cd build\RelWithDebInfo
+```
+
+**Is the device bound?**
+
+```powershell
+.\qcamctl.exe list
+```
+```
+1 camera(s):
+  046d:0840  Logitech QuickCam Express (qcam)   STV0600
+             \\?\usb#vid_046d&pid_0840#5&1b2c3d4e&0&2#{b17cb711-...}
+```
+
+Empty means step 3 did not finish. The command prints the table of device ids
+it knows, so you can compare.
+
+**Does the sensor answer?**
+
+```powershell
+.\qcamctl.exe probe
+```
+```
+camera opened.
+  device      : 046d:0840  Logitech QuickCam Express (qcam)
+  sensor      : Agilent HDCS-1000/1100
+  native      : 360x296 Bayer GRBG
+  output      : 360x296 NV12
+  nominal fps : 7.91
+```
+
+This is the first real proof of life: the bridge accepted control transfers,
+the I2C master worked, and the sensor's identity register read back `0x08`.
+
+If it says *no supported sensor answered*, run `.\qcamctl.exe regdump` and look
+at sensor register `0x00` — `0x08` is HDCS-1000/1100, `0x10` is HDCS-1020, and
+anything else means a Photobit PB-0100 or ST VV6410 that needs a sensor back
+end writing against the `ISensor` interface.
+
+**Do frames arrive?**
+
+```powershell
+.\qcamctl.exe stream -t 10
+```
+```
+      8 frames   7.84 fps  luma 112  exp  61  gain  50  short 0  overrun 0  unknown 0
+     16 frames   7.91 fps  luma 118  exp  58  gain  50  short 0  overrun 0  unknown 0
+```
+
+What to read here:
+
+| Column | What it means |
+| --- | --- |
+| `fps` | Should settle near **7.9**. Much lower means packets are being dropped. |
+| `luma` | Metered brightness. Should converge toward ~118. |
+| `exp` / `gain` | Auto-exposure working. They should move, then settle. |
+| `short` | Frames that ended early — bandwidth trouble. Should be 0 or near it. |
+| `overrun` | Packet size mismatch. Should be 0. |
+| `unknown` | **The important one.** Anything but 0 means the chunk framing is not what this driver expects. |
+
+If `iso packets` is 0 in the summary, the transfer never started — free some
+USB bandwidth (unplug other cameras and audio interfaces, which reserve
+isochronous bandwidth whether or not they are streaming) or try
+`--packet-size 600`, which trades frame rate for a smaller reservation.
+
+**Do frames look right?**
+
+```powershell
+.\qcamctl.exe capture -n 3
+```
+
+Three BMPs in the current directory. Auto-exposure gets ~8 frames to settle
+before the first is written.
+
+If the picture is black or blown out, pin the controls manually to separate an
+exposure problem from a plumbing problem:
+
+```powershell
+.\qcamctl.exe capture -n 1 --exposure 60 --gain 40 --no-awb
+```
+
+If the colours are wrong but the shapes are right, dump the mosaic straight off
+the sensor and look at it yourself — this bypasses the entire colour pipeline:
+
+```powershell
+.\qcamctl.exe capture -n 1 -f raw
+```
+
+That writes a 360×296 8-bit Bayer file. Open it in GIMP as "Raw image data",
+360×296, 8-bit greyscale; you should see the Bayer checkerboard.
+
+Other flags worth knowing: `--malvar` for a better demosaic, `--size WxH` to
+crop or scale, and `-v` on any command to log every single USB control
+transfer — which is the fastest way to see exactly what reached the hardware
+before things went wrong.
+
+### 5. Install the service and the virtual camera
+
+Only once step 4 produces good frames.
+
+```powershell
+.\scripts\install.ps1 -BinDir .\build\RelWithDebInfo
+```
+
+That registers the COM media source, installs `qcamsvc` and starts it.
+
+The service takes **exclusive** ownership of the camera from here on, so
+`qcamctl probe`, `capture` and `stream` will report `Busy`. That is deliberate,
+not a limitation: opening the device runs the sensor init sequence, and a
+second process doing that to a live stream would corrupt it. Stop the service
+(`Stop-Service qcamsvc`) when you want to drive the hardware directly again.
+
+While it is running, use `attach` instead — it reads the service's
+shared-memory ring, exactly the way the virtual camera does:
+
+```powershell
+.\qcamctl.exe attach -t 5
+```
+
+**Working looks like:** open the Windows Camera app, and *"Logitech QuickCam
+Express (qcam)"* is in the camera list. Then try Teams, Zoom or OBS.
+
+To watch the service work, stop it and run it in the foreground:
+
+```powershell
+Stop-Service qcamsvc
+.\qcamsvc.exe --console -v
+```
+
+To undo everything: `.\scripts\uninstall.ps1 -BinDir .\build\RelWithDebInfo -RemoveDriver`.
+
+### If it doesn't work
+
+[`docs/troubleshooting.md`](docs/troubleshooting.md) walks the same four layers
+with a failure table for each.
+
+The one failure worth reporting in detail is **`unknown` chunks in step 4**.
+The framing rules came from the documented STV06xx protocol, not from a capture
+of your specific camera, so a nonzero count there is genuinely new information
+about this hardware revision. Capture it with
+[USBPcap](https://desowin.org/usbpcap/) while `qcamctl stream` runs, and look at
+the isochronous IN payloads in Wireshark: each chunk should begin with a 4-byte
+header of big-endian id then big-endian length.
+[`docs/protocol.md`](docs/protocol.md) lists the ids this driver knows.
+`src/core/framer.cpp` is where a new one goes, and `tests/test_framer.cpp`
+shows how to write a test for it without the camera attached.
+
 ## Why the camera doesn't work today
 
 It predates USB Video Class by about four years. UVC arrived in 2003 and is
@@ -77,34 +319,6 @@ user-mode media source appear to every app as a real camera.
 | `src/qcamvcam/` | Media Foundation virtual camera source (COM in-proc server) |
 | `src/qcamctl/` | Diagnostics and capture CLI |
 | `tests/` | 96 unit tests, runnable with no hardware attached |
-
-## Quick start
-
-```powershell
-# Build (Visual Studio 2022 with the Desktop C++ workload)
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config RelWithDebInfo
-
-# Install (administrator). See docs/installing.md about driver signing first.
-.\scripts\install.ps1 -BinDir .\build\RelWithDebInfo
-
-# Check it
-.\build\RelWithDebInfo\qcamctl.exe list
-.\build\RelWithDebInfo\qcamctl.exe probe
-.\build\RelWithDebInfo\qcamctl.exe capture -n 3
-```
-
-`qcamctl` is the tool to reach for when something is wrong: it brings the
-camera up one layer at a time and tells you which layer failed.
-
-```
-qcamctl list       cameras bound to the WinUSB driver
-qcamctl probe      open the device and read back what the sensor says it is
-qcamctl regdump    dump every bridge and sensor register
-qcamctl capture    write frames to BMP, or the raw Bayer mosaic
-qcamctl stream     throughput, frame rate, dropped/short/unknown chunk counts
-qcamctl selftest   exercise the whole stack against a mock device
-```
 
 ## State of the code
 

@@ -75,16 +75,33 @@ public:
     Status Open(const std::string& path) {
         info_.device_path = path;
 
-        // FILE_FLAG_OVERLAPPED is mandatory: the isochronous reads below are
-        // all asynchronous.
+        // Two things about this open:
+        //
+        // FILE_FLAG_OVERLAPPED is mandatory, because the isochronous reads
+        // below are all asynchronous.
+        //
+        // The share mode is zero, i.e. exclusive. WinUSB itself would permit
+        // several handles to the same interface, but this camera cannot
+        // survive it: opening the device runs the sensor init sequence, which
+        // resets the sensor and reprograms its timing. A second process doing
+        // that to a live stream produces garbage in the first one. Exclusive
+        // access turns that race into an honest ERROR_SHARING_VIOLATION, which
+        // surfaces as Status::Busy.
         device_ = ::CreateFileW(Widen(path).c_str(), GENERIC_READ | GENERIC_WRITE,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                /*dwShareMode=*/0, nullptr,
                                 OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                                 nullptr);
         if (device_ == INVALID_HANDLE_VALUE) {
             const DWORD err = ::GetLastError();
-            QCAM_LOGE("CreateFile on %s failed: %lu", path.c_str(), err);
+            if (err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED) {
+                QCAM_LOGE("the camera is already open in another process "
+                          "(the qcam service, most likely). Stop it with "
+                          "'Stop-Service qcamsvc', or use 'qcamctl attach' to "
+                          "read the frames it is already publishing.");
+            } else {
+                QCAM_LOGE("CreateFile on %s failed: %lu", path.c_str(), err);
+            }
             return StatusFromLastError(err);
         }
 
