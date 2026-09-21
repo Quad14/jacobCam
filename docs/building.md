@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| **Visual Studio 2022** | "Desktop development with C++" workload |
+| **Visual Studio 2022 or newer** | "Desktop development with C++" workload |
 | **Windows 11 SDK** | 10.0.22000 or later — `mfvirtualcamera.h` and `mfsensorgroup.lib` are not in older SDKs |
 | **CMake** | 3.20 or later (ships with Visual Studio) |
 
@@ -15,9 +15,14 @@ distribution — see `docs/installing.md` — but not to build.
 ## Windows
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64
 cmake --build build --config RelWithDebInfo
 ```
+
+No `-G`: CMake's default generator on Windows is the newest Visual Studio it
+can find. Pinning one (`-G "Visual Studio 17 2022"`) works but ages badly —
+it is exactly what broke CI when the hosted runner image moved on. `-A`
+selects the target architecture and every Visual Studio generator accepts it.
 
 Output in `build\RelWithDebInfo\`:
 

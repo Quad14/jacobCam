@@ -37,8 +37,8 @@ Budget an hour for the first run, most of it in steps 2 and 3.
 - **Windows 11**, build 22000 or later, for the camera to appear in apps.
   Windows 10 works for everything except that last step; `MFCreateVirtualCamera`
   is Win11-only.
-- **Visual Studio 2022** with "Desktop development with C++", and the
-  **Windows 11 SDK** (10.0.22000+). Older SDKs lack `mfvirtualcamera.h`.
+- **Visual Studio 2022 or newer** with "Desktop development with C++", and
+  the **Windows 11 SDK** (10.0.22000+). Older SDKs lack `mfvirtualcamera.h`.
   No WDK needed to build.
 - An elevated PowerShell for steps 3 and 5.
 
@@ -56,9 +56,13 @@ part-number table.
 ### 2. Build, and prove the protocol stack before touching hardware
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64
 cmake --build build --config RelWithDebInfo
 ```
+
+Leaving the generator out is deliberate: CMake picks the newest Visual Studio
+it finds, so this keeps working as you upgrade. Pass
+`-G "Visual Studio 17 2022"` only if you need to pin a specific one.
 
 **Expect compile errors on this first build.** The portable core is known
 good; anything MSVC complains about will be in `src/win/`, `src/qcamsvc/` or

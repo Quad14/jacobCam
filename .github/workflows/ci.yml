@@ -70,8 +70,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # When the hosted image's Visual Studio version moves, a pinned
+      # generator fails with "could not find any instance of Visual Studio"
+      # and no other clue. Print what is actually there first.
+      - name: Show toolchain
+        run: |
+          cmake --version
+          cmake --help | Select-String -Pattern 'Visual Studio'
+
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }}
+        # Deliberately no -G. CMake's default generator on Windows is the
+        # newest Visual Studio it can find, so this tracks the runner image
+        # instead of breaking every time it is updated. -A still selects the
+        # target architecture, which every VS generator accepts.
+        run: cmake -S . -B build -A ${{ matrix.arch }}
 
       - name: Build
         run: cmake --build build --config RelWithDebInfo --parallel
