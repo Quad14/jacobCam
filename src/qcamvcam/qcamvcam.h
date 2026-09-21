@@ -13,15 +13,40 @@
 
 #include <windows.h>
 
+// The build defines WIN32_LEAN_AND_MEAN, so <windows.h> does not pull COM in.
+// The kernel-streaming headers below assume it is already there, so bring it
+// in explicitly first. Without this, <cguid.h> is reached in a state where
+// __uuidof is not yet usable and the SDK header fails to parse.
+#include <objbase.h>
+
 #include <ks.h>
 #include <ksmedia.h>
-// IKsControl itself is declared in ksproxy.h; ks.h only provides the
-// KSPROPERTY structures it carries.
-#include <ksproxy.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfobjects.h>
 #include <wrl/client.h>
+
+// IKsControl is declared in <ksproxy.h>, but that header drags in
+// DirectShow-era dependencies and does not survive being included here. The
+// interface is three methods behind a fixed IID, so declare it directly --
+// the same approach Microsoft's own virtual camera samples take. <ks.h>
+// above supplies the KSPROPERTY / KSMETHOD / KSEVENT types it carries.
+#ifndef __IKsControl_INTERFACE_DEFINED__
+#define __IKsControl_INTERFACE_DEFINED__
+MIDL_INTERFACE("28F54685-06FD-11D2-B27A-00A0C9223196")
+IKsControl : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE KsProperty(
+        PKSPROPERTY Property, ULONG PropertyLength, void* PropertyData,
+        ULONG DataLength, ULONG* BytesReturned) = 0;
+    virtual HRESULT STDMETHODCALLTYPE KsMethod(
+        PKSMETHOD Method, ULONG MethodLength, void* MethodData,
+        ULONG DataLength, ULONG* BytesReturned) = 0;
+    virtual HRESULT STDMETHODCALLTYPE KsEvent(
+        PKSEVENT Event, ULONG EventLength, void* EventData,
+        ULONG DataLength, ULONG* BytesReturned) = 0;
+};
+#endif  // __IKsControl_INTERFACE_DEFINED__
 
 #include <atomic>
 #include <mutex>

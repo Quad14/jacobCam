@@ -153,12 +153,12 @@ TEST(RgbToNv12ProducesStudioSwingLuma) {
     Rgb24ToNv12(rgb.data(), w, h, nv12.data());
     CHECK_EQ(int{nv12[0]}, 16);
 
-    std::fill(rgb.begin(), rgb.end(), 255);
+    std::fill(rgb.begin(), rgb.end(), uint8_t{255});
     Rgb24ToNv12(rgb.data(), w, h, nv12.data());
     CHECK_NEAR(nv12[0], 235, 1);
 
     // Neutral grey must leave chroma at 128.
-    std::fill(rgb.begin(), rgb.end(), 128);
+    std::fill(rgb.begin(), rgb.end(), uint8_t{128});
     Rgb24ToNv12(rgb.data(), w, h, nv12.data());
     const uint8_t* uv = nv12.data() + w * h;
     CHECK_NEAR(uv[0], 128, 1);
