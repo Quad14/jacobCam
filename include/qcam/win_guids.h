@@ -31,6 +31,7 @@ DEFINE_GUID(CLSID_QcamActivator,
 #define QCAM_RING_EVENT   L"Global\\qcam.frame.4EA75BBB"
 #define QCAM_DEMAND_EVENT L"Global\\qcam.demand.4EA75BBB"
 #define QCAM_RING_MUTEX   L"Global\\qcam.lock.4EA75BBB"
+#define QCAM_CONTROLS_NAME L"Global\\qcam.controls.4EA75BBB"
 #define QCAM_CONTROL_PIPE L"\\\\.\\pipe\\qcam.control.4EA75BBB"
 
 // The per-service SID qcamsvc runs with. It is the only non-administrator

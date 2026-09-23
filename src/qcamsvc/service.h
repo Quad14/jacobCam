@@ -26,8 +26,10 @@ namespace qcam {
 
 struct ServiceOptions {
     PixelFormat format     = PixelFormat::Nv12;
-    uint16_t    out_width  = 352;   // CIF, centre-cropped from the native 360x296
-    uint16_t    out_height = 288;
+    // 0 => the sensor's native size (360x296 on the HDCS-1000). The virtual
+    // camera scales that to whatever size an app picks.
+    uint16_t    out_width  = 0;
+    uint16_t    out_height = 0;
     // The installed service never registers a camera: that needs
     // administrator rights, which it does not have, so install.ps1 registers
     // a persistent one instead. This is for debugging in console mode from
@@ -59,6 +61,7 @@ private:
     Camera            camera_;
     FrameRingWriter   ring_;
     FrameDemand       demand_;
+    PictureControlHost controls_;
     VirtualCamera     vcam_;
     std::atomic<bool> stop_{false};
     HANDLE            stop_event_ = nullptr;

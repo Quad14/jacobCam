@@ -164,7 +164,7 @@ Stop-Service qcamsvc
 Useful options:
 
 ```
---size WxH        published frame size (default 352x288)
+--size WxH        published frame size (default: sensor native, 360x296)
 --vcam            console mode: register a temporary camera until Ctrl-C
 --always-on       console mode: stream whenever the camera is plugged in
 --name "TEXT"     friendly name shown in app camera pickers

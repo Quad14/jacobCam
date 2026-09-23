@@ -49,6 +49,9 @@ uint8_t* SlotAt(uint8_t* base, uint32_t slot_bytes, uint32_t index) {
 // the demand event.
 constexpr wchar_t kSectionAll[]  = L"GA";
 constexpr wchar_t kSectionRead[] = L"GR";
+// The picture-control block is the one object the Frame Server may write:
+// that is how an app's brightness slider reaches the decoder.
+constexpr wchar_t kSectionReadWrite[] = L"GRGW";
 constexpr wchar_t kEventAll[]    = L"0x1F0003";    // EVENT_ALL_ACCESS
 constexpr wchar_t kEventRead[]   = L"0x00100002";  // SYNCHRONIZE | EVENT_MODIFY_STATE
 
@@ -514,6 +517,136 @@ Status FrameRingReader::Read(std::vector<uint8_t>* out, FrameMeta* meta,
         if (wait == WAIT_TIMEOUT) return Status::Timeout;
         if (wait != WAIT_OBJECT_0) return Status::Io;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Picture controls
+// ---------------------------------------------------------------------------
+
+namespace {
+
+PictureControls LoadControls(const ControlBlock* block) {
+    PictureControls p;
+    p.brightness = block->brightness.load(std::memory_order_relaxed);
+    p.contrast   = block->contrast.load(std::memory_order_relaxed);
+    p.saturation = block->saturation.load(std::memory_order_relaxed);
+    p.gamma      = block->gamma.load(std::memory_order_relaxed);
+    return p;
+}
+
+void StoreControls(ControlBlock* block, const PictureControls& p) {
+    block->brightness.store(p.brightness, std::memory_order_relaxed);
+    block->contrast.store(p.contrast, std::memory_order_relaxed);
+    block->saturation.store(p.saturation, std::memory_order_relaxed);
+    block->gamma.store(p.gamma, std::memory_order_relaxed);
+    // Release: a reader that sees the new generation sees the values too.
+    block->generation.fetch_add(1, std::memory_order_release);
+}
+
+}  // namespace
+
+struct PictureControlHost::Impl {
+    HANDLE          mapping = nullptr;
+    ControlBlock*   block   = nullptr;
+    uint32_t        seen_generation = 0;
+    PictureControls current;
+
+    ~Impl() { Close(); }
+    void Close() {
+        if (block)   { ::UnmapViewOfFile(block); block = nullptr; }
+        if (mapping) { ::CloseHandle(mapping); mapping = nullptr; }
+    }
+};
+
+PictureControlHost::PictureControlHost() : impl_(new Impl()) {}
+PictureControlHost::~PictureControlHost() = default;
+
+Status PictureControlHost::Create(const PictureControls& initial) {
+    Close();
+    impl_->current = initial;
+
+    const std::wstring sddl = BuildSddl(kSectionAll, kSectionReadWrite);
+    ScopedSecurityAttributes sa(sddl.c_str());
+    impl_->mapping = ::CreateFileMappingW(INVALID_HANDLE_VALUE, sa.get(), PAGE_READWRITE,
+                                          0, sizeof(ControlBlock), QCAM_CONTROLS_NAME);
+    if (!impl_->mapping) {
+        QCAM_LOGE("CreateFileMapping (controls) failed: %lu", ::GetLastError());
+        return Status::Io;
+    }
+    impl_->block = static_cast<ControlBlock*>(
+        ::MapViewOfFile(impl_->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ControlBlock)));
+    if (!impl_->block) {
+        QCAM_LOGE("MapViewOfFile (controls) failed: %lu", ::GetLastError());
+        impl_->Close();
+        return Status::Io;
+    }
+
+    impl_->block->magic   = kControlMagic;
+    impl_->block->version = kControlVersion;
+    StoreControls(impl_->block, initial);
+    impl_->seen_generation = impl_->block->generation.load(std::memory_order_acquire);
+    return Status::Ok;
+}
+
+void PictureControlHost::Close() {
+    if (impl_) impl_->Close();
+}
+
+PictureControls PictureControlHost::Current() const { return impl_->current; }
+
+bool PictureControlHost::Poll(PictureControls* out) {
+    if (!impl_->block) return false;
+    const uint32_t gen = impl_->block->generation.load(std::memory_order_acquire);
+    if (gen == impl_->seen_generation) return false;
+    impl_->seen_generation = gen;
+    impl_->current = LoadControls(impl_->block);
+    if (out) *out = impl_->current;
+    return true;
+}
+
+struct PictureControlClient::Impl {
+    HANDLE        mapping = nullptr;
+    ControlBlock* block   = nullptr;
+
+    ~Impl() {
+        if (block)   ::UnmapViewOfFile(block);
+        if (mapping) ::CloseHandle(mapping);
+    }
+};
+
+PictureControlClient::PictureControlClient() : impl_(new Impl()) {}
+PictureControlClient::~PictureControlClient() = default;
+
+bool PictureControlClient::IsOpen() const { return impl_ && impl_->block != nullptr; }
+
+Status PictureControlClient::Open() {
+    if (IsOpen()) return Status::Ok;
+    impl_->mapping = ::OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
+                                        QCAM_CONTROLS_NAME);
+    if (!impl_->mapping) {
+        const DWORD err = ::GetLastError();
+        return (err == ERROR_ACCESS_DENIED) ? Status::Busy : Status::NoDevice;
+    }
+    auto* block = static_cast<ControlBlock*>(::MapViewOfFile(
+        impl_->mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(ControlBlock)));
+    if (!block || block->magic != kControlMagic || block->version != kControlVersion) {
+        if (block) ::UnmapViewOfFile(block);
+        ::CloseHandle(impl_->mapping);
+        impl_->mapping = nullptr;
+        return block ? Status::Unsupported : Status::Io;
+    }
+    impl_->block = block;
+    return Status::Ok;
+}
+
+PictureControls PictureControlClient::Get() const {
+    return IsOpen() ? LoadControls(impl_->block) : PictureControls{};
+}
+
+Status PictureControlClient::Set(const PictureControls& controls) {
+    if (!IsOpen()) return Status::NoDevice;
+    StoreControls(impl_->block, controls);
+    return Status::Ok;
 }
 
 }  // namespace qcam

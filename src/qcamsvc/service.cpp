@@ -30,6 +30,13 @@ constexpr DWORD kStreamingPollMs = 1000;
 // resolution, a call being put on hold) without re-running sensor init.
 constexpr ULONGLONG kIdleTimeoutMs = 10000;
 
+// Longest exposure that still fits in one frame period. Measured on an
+// HDCS-1000 at the default window: up to 128 the camera holds its full
+// ~7.9 fps, and every step beyond stretches the frame (255 gives ~3.2 fps).
+// Auto-exposure stops here and makes up the rest with gain, trading a noisier
+// picture in dim light for motion that stays smooth.
+constexpr int kFullRateExposureMax = 128;
+
 SERVICE_STATUS         g_status = {};
 SERVICE_STATUS_HANDLE  g_status_handle = nullptr;
 CameraService*         g_service = nullptr;
@@ -86,6 +93,15 @@ void CameraService::Stop() {
 }
 
 void CameraService::PublishFrame(const DecodedFrame& frame) {
+    // An app moved a slider. Runs on the streaming thread, so the change lands
+    // at a frame boundary.
+    PictureControls controls;
+    if (controls_.Poll(&controls)) {
+        ColorSettings color = camera_.color_settings();
+        ApplyPictureControls(controls, &color);
+        camera_.SetColorSettings(color);
+    }
+
     const Status st = ring_.Publish(frame.data, frame.size, frame.sequence,
                                     frame.timestamp_100ns);
     if (Failed(st)) {
@@ -116,6 +132,9 @@ Status CameraService::OpenAndStream(const ServiceOptions& options) {
     // solid grey frame, which an app shows as a flash. Drop them: the virtual
     // camera repeats the previous frame instead.
     cfg.emit_short_frames = false;
+    cfg.auto_exposure.exposure_max = kFullRateExposureMax;
+    // Whatever an app last set, including before this stream started.
+    ApplyPictureControls(controls_.Current(), &cfg.color);
 
     QCAM_TRY(camera_.OpenFirst(cfg));
 
@@ -191,6 +210,10 @@ Status CameraService::Run(const ServiceOptions& options) {
     }
     if (demand) QCAM_LOGI("waiting for an app to ask for frames");
 
+    // Lives as long as the service, so app settings outlast individual streams.
+    if (Failed(controls_.Create(PictureControls{})))
+        QCAM_LOGW("no picture-control block; app brightness/contrast will not apply");
+
     bool streaming = false;
     bool demanded_ever = false;
     ULONGLONG last_demand = 0;
@@ -250,6 +273,7 @@ Status CameraService::Run(const ServiceOptions& options) {
     QCAM_LOGI("shutting down");
     ReleaseCamera();
     demand_.Close();
+    controls_.Close();
     vcam_.Stop();
     vcam_.Close();
     ::MFShutdown();

@@ -63,10 +63,15 @@ using Microsoft::WRL::ComPtr;
 
 // Fallback format used when the service is not running yet, so the camera
 // still enumerates with a sane media type instead of failing to open.
-constexpr UINT32 kDefaultWidth   = 352;
-constexpr UINT32 kDefaultHeight  = 288;
-constexpr UINT32 kDefaultFpsNum  = 15;
-constexpr UINT32 kDefaultFpsDen  = 2;   // 7.5 fps, what the hardware sustains
+constexpr UINT32 kDefaultWidth   = 360;  // HDCS-1000 native
+constexpr UINT32 kDefaultHeight  = 296;
+constexpr UINT32 kDefaultFpsNum  = 791;
+constexpr UINT32 kDefaultFpsDen  = 100; // 7.91 fps, what the hardware sustains
+
+// Sizes offered besides the native one. Scaled from the native frame (after a
+// centre crop to 4:3): no extra detail, but apps that only accept standard
+// sizes can open the camera.
+constexpr struct { UINT32 width, height; } kExtraSizes[] = {{640, 480}, {320, 240}};
 
 class QcamMediaSource;
 
@@ -121,6 +126,8 @@ private:
     HRESULT CopyIntoAllocatedSample(IMFVideoSampleAllocatorEx* allocator,
                                     const uint8_t* data, size_t size,
                                     IMFSample** out);
+    // Adopts the size of the media type the app selected. Called on Start.
+    void    UpdateOutputSize();
 
     std::atomic<ULONG>        ref_count_{1};
     mutable std::mutex        mutex_;
@@ -129,11 +136,14 @@ private:
     ComPtr<IMFMediaEventQueue> event_queue_;
     ComPtr<IMFStreamDescriptor> descriptor_;
 
+    // Output size: the media type the app selected, which the ring's native
+    // frames are scaled to.
     UINT32   width_   = kDefaultWidth;
     UINT32   height_  = kDefaultHeight;
     UINT32   fps_num_ = kDefaultFpsNum;
     UINT32   fps_den_ = kDefaultFpsDen;
     size_t   frame_bytes_ = 0;
+    std::vector<uint8_t> scaled_;              // worker thread only
     LONGLONG frame_duration_100ns_ = 0;
 
     MF_STREAM_STATE  state_ = MF_STREAM_STATE_STOPPED;
@@ -222,7 +232,7 @@ public:
 
 private:
     HRESULT CheckShutdown() const;
-    HRESULT CreateMediaType(IMFMediaType** out) const;
+    HRESULT CreateMediaType(UINT32 width, UINT32 height, IMFMediaType** out) const;
     HRESULT HandleVideoProcAmp(PKSPROPERTY property, void* data, ULONG data_length,
                                ULONG* bytes_returned);
 
@@ -234,6 +244,11 @@ private:
     ComPtr<IMFAttributes>            source_attributes_;
     ComPtr<IMFAttributes>            stream_attributes_;
     QcamMediaStream*                 stream_ = nullptr;
+
+    // Brightness and friends, shared with qcamsvc. While the service is not
+    // running, settings are kept here and handed over once it appears.
+    PictureControlClient             controls_;
+    PictureControls                  local_controls_;
 
     UINT32 width_   = kDefaultWidth;
     UINT32 height_  = kDefaultHeight;

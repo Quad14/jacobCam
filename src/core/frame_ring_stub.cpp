@@ -48,4 +48,25 @@ Status FrameRingReader::Read(std::vector<uint8_t>*, FrameMeta*, uint32_t) {
     return Status::Unsupported;
 }
 
+struct PictureControlHost::Impl { PictureControls current; };
+
+PictureControlHost::PictureControlHost() : impl_(new Impl()) {}
+PictureControlHost::~PictureControlHost() = default;
+Status PictureControlHost::Create(const PictureControls& initial) {
+    impl_->current = initial;
+    return Status::Unsupported;
+}
+void PictureControlHost::Close() {}
+PictureControls PictureControlHost::Current() const { return impl_->current; }
+bool PictureControlHost::Poll(PictureControls*) { return false; }
+
+struct PictureControlClient::Impl {};
+
+PictureControlClient::PictureControlClient() = default;
+PictureControlClient::~PictureControlClient() = default;
+Status PictureControlClient::Open() { return Status::Unsupported; }
+bool PictureControlClient::IsOpen() const { return false; }
+PictureControls PictureControlClient::Get() const { return PictureControls{}; }
+Status PictureControlClient::Set(const PictureControls&) { return Status::Unsupported; }
+
 }  // namespace qcam

@@ -3,7 +3,9 @@
 
 #include <mferror.h>
 
+#include <algorithm>
 #include <new>
+#include <vector>
 
 #include "qcam/log.h"
 
@@ -64,7 +66,8 @@ bool QcamMediaSource::IsShutdown() const {
     return shutdown_;
 }
 
-HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
+HRESULT QcamMediaSource::CreateMediaType(UINT32 width, UINT32 height,
+                                         IMFMediaType** out) const {
     if (!out) return E_POINTER;
     *out = nullptr;
 
@@ -77,7 +80,7 @@ HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
     hr = type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     if (FAILED(hr)) return hr;
 
-    hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width_, height_);
+    hr = MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width, height);
     if (FAILED(hr)) return hr;
     hr = MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, fps_num_, fps_den_);
     if (FAILED(hr)) return hr;
@@ -89,12 +92,12 @@ HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
     hr = type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     if (FAILED(hr)) return hr;
     // NV12 here is packed, so the stride is just the width.
-    hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, width_);
+    hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
     if (FAILED(hr)) return hr;
     hr = type->SetUINT32(MF_MT_SAMPLE_SIZE,
                          static_cast<UINT32>(ImageSize(PixelFormat::Nv12,
-                                                       static_cast<uint16_t>(width_),
-                                                       static_cast<uint16_t>(height_))));
+                                                       static_cast<uint16_t>(width),
+                                                       static_cast<uint16_t>(height))));
     if (FAILED(hr)) return hr;
     hr = type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
     if (FAILED(hr)) return hr;
@@ -135,20 +138,30 @@ HRESULT QcamMediaSource::Initialize() {
     HRESULT hr = MFCreateEventQueue(&event_queue_);
     if (FAILED(hr)) return hr;
 
-    ComPtr<IMFMediaType> type;
-    hr = CreateMediaType(&type);
+    // Native size first, so it is the default; then the standard sizes the
+    // stream scales to for apps that insist on one.
+    std::vector<ComPtr<IMFMediaType>> types;
+    types.emplace_back();
+    hr = CreateMediaType(width_, height_, &types.back());
     if (FAILED(hr)) return hr;
+    for (const auto& size : kExtraSizes) {
+        if (size.width == width_ && size.height == height_) continue;
+        types.emplace_back();
+        hr = CreateMediaType(size.width, size.height, &types.back());
+        if (FAILED(hr)) return hr;
+    }
 
-    IMFMediaType* types[] = {type.Get()};
+    std::vector<IMFMediaType*> raw_types;
+    for (const auto& t : types) raw_types.push_back(t.Get());
     ComPtr<IMFStreamDescriptor> stream_descriptor;
-    hr = MFCreateStreamDescriptor(/*streamId=*/0, /*cMediaTypes=*/1, types,
-                                  &stream_descriptor);
+    hr = MFCreateStreamDescriptor(/*streamId=*/0, static_cast<DWORD>(raw_types.size()),
+                                  raw_types.data(), &stream_descriptor);
     if (FAILED(hr)) return hr;
 
     ComPtr<IMFMediaTypeHandler> handler;
     hr = stream_descriptor->GetMediaTypeHandler(&handler);
     if (FAILED(hr)) return hr;
-    hr = handler->SetCurrentMediaType(type.Get());
+    hr = handler->SetCurrentMediaType(types.front().Get());
     if (FAILED(hr)) return hr;
 
     IMFStreamDescriptor* descriptors[] = {stream_descriptor.Get()};
@@ -576,8 +589,23 @@ HRESULT QcamMediaSource::HandleVideoProcAmp(PKSPROPERTY property, void* data,
 
     auto* procamp = static_cast<PKSPROPERTY_VIDEOPROCAMP_S>(data);
 
+    // The four controls the decoder applies; gain and white balance stay
+    // automatic and just report their defaults.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!controls_.IsOpen() && Succeeded(controls_.Open()))
+        controls_.Set(local_controls_);   // settings made while qcamsvc was down
+    PictureControls current = controls_.IsOpen() ? controls_.Get() : local_controls_;
+    int32_t* field = nullptr;
+    switch (property->Id) {
+        case KSPROPERTY_VIDEOPROCAMP_BRIGHTNESS: field = &current.brightness; break;
+        case KSPROPERTY_VIDEOPROCAMP_CONTRAST:   field = &current.contrast;   break;
+        case KSPROPERTY_VIDEOPROCAMP_SATURATION: field = &current.saturation; break;
+        case KSPROPERTY_VIDEOPROCAMP_GAMMA:      field = &current.gamma;      break;
+        default: break;
+    }
+
     if (property->Flags & KSPROPERTY_TYPE_GET) {
-        procamp->Value        = range->default_value;
+        procamp->Value        = field ? *field : range->default_value;
         procamp->Flags        = range->capabilities;
         procamp->Capabilities = range->capabilities;
         if (bytes_returned) *bytes_returned = sizeof(KSPROPERTY_VIDEOPROCAMP_S);
@@ -585,13 +613,14 @@ HRESULT QcamMediaSource::HandleVideoProcAmp(PKSPROPERTY property, void* data,
     }
 
     if (property->Flags & KSPROPERTY_TYPE_SET) {
-        // Accepted and acknowledged. Applying these means round-tripping to
-        // qcamsvc, which owns the decoder; until that control channel exists
-        // the value is reported back but does not change the picture.
-        QCAM_LOGD("VideoProcAmp set: property %lu = %ld (not yet routed to the "
-                  "capture service)",
-                  static_cast<unsigned long>(property->Id),
-                  static_cast<long>(procamp->Value));
+        if (field) {
+            *field = std::clamp(static_cast<int32_t>(procamp->Value),
+                                static_cast<int32_t>(range->min),
+                                static_cast<int32_t>(range->max));
+            local_controls_ = current;
+            // qcamsvc picks this up at its next frame.
+            if (controls_.IsOpen()) controls_.Set(current);
+        }
         if (bytes_returned) *bytes_returned = sizeof(KSPROPERTY_VIDEOPROCAMP_S);
         return S_OK;
     }

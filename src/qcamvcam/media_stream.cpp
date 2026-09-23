@@ -215,6 +215,7 @@ HRESULT QcamMediaStream::Start() {
         if (state_ == MF_STREAM_STATE_RUNNING) return S_OK;
         state_ = MF_STREAM_STATE_RUNNING;
         next_timestamp_ = 0;
+        UpdateOutputSize();
 
         if (!ring_open_) {
             // The service may not be running yet. That is not fatal: the
@@ -282,6 +283,32 @@ HRESULT QcamMediaStream::SetAllocator(IUnknown* allocator) {
     allocator_ = video_allocator;
     allocator_ready_ = false;
     return S_OK;
+}
+
+void QcamMediaStream::UpdateOutputSize() {
+    // mutex_ is held by the caller.
+    ComPtr<IMFMediaTypeHandler> handler;
+    ComPtr<IMFMediaType> type;
+    UINT32 w = 0, h = 0;
+    if (!descriptor_ || FAILED(descriptor_->GetMediaTypeHandler(&handler)) ||
+        FAILED(handler->GetCurrentMediaType(&type)) ||
+        FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h)) || !w || !h) {
+        return;
+    }
+    if (w == width_ && h == height_) return;
+
+    width_  = w;
+    height_ = h;
+    frame_bytes_ = ImageSize(PixelFormat::Nv12, static_cast<uint16_t>(w),
+                             static_cast<uint16_t>(h));
+    // A frame kept for repeating is the old size; the allocator's samples
+    // are too, so re-initialise it for the new type.
+    last_frame_.clear();
+    if (allocator_ && allocator_ready_) {
+        allocator_->UninitializeSampleAllocator();
+        allocator_ready_ = false;
+    }
+    QCAM_LOGI("app selected %ux%u", w, h);
 }
 
 HRESULT QcamMediaStream::SetRate(float) {
@@ -389,13 +416,21 @@ HRESULT QcamMediaStream::CreateSampleFromRing(IMFSample** out) {
     }
     if (Failed(st)) return E_PENDING;
 
-    if (frame.size() != frame_bytes_) {
-        // The service is publishing a different size than we advertised.
-        // Sending it anyway would corrupt the consumer's buffer.
-        QCAM_LOGW("ring frame is %zu bytes, expected %zu; check that qcamsvc "
-                  "and the virtual camera agree on --size",
-                  frame.size(), frame_bytes_);
+    if (meta.format != PixelFormat::Nv12 || (meta.width & 1) || (meta.height & 1) ||
+        frame.size() != ImageSize(PixelFormat::Nv12, static_cast<uint16_t>(meta.width),
+                                  static_cast<uint16_t>(meta.height))) {
+        QCAM_LOGW("ring frame %ux%u (%zu bytes) is not usable NV12", meta.width,
+                  meta.height, frame.size());
         return E_PENDING;
+    }
+
+    // The ring carries the native size; scale to the one the app picked.
+    if (meta.width != width_ || meta.height != height_) {
+        scaled_.resize(frame_bytes_);
+        ScaleNv12(frame.data(), static_cast<uint16_t>(meta.width),
+                  static_cast<uint16_t>(meta.height), scaled_.data(),
+                  static_cast<uint16_t>(width_), static_cast<uint16_t>(height_));
+        frame.swap(scaled_);
     }
 
     const HRESULT hr = WrapBuffer(frame.data(), frame.size(), next_timestamp_, out);
