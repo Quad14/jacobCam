@@ -148,7 +148,6 @@ Status Camera::Start(FrameHandler handler) {
     QCAM_TRY(bridge_->SetIsoPacketSize(packet));
     QCAM_TRY(sensor_->Start(*bridge_));
     QCAM_TRY(bridge_->EnableIso(true));
-    bridge_->SetLed(true);
 
     st = transport_->StartIso(&framer_);
     if (Failed(st)) {
@@ -221,6 +220,7 @@ void Camera::OnRawFrame(const RawFrame& raw) {
         frame.height          = decoder_.out_height();
         frame.sequence        = raw.sequence;
         frame.timestamp_100ns = raw.timestamp_100ns;
+        frame.complete        = raw.complete;
         handler_(frame);
     }
 

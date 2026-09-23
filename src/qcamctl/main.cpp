@@ -296,6 +296,7 @@ int CmdCapture(const Args& args) {
     std::atomic<int> seen{0};
 
     const Status st = camera.Start([&](const DecodedFrame& frame) {
+        if (!frame.complete) return;
         const int n = ++seen;
         if (n <= warmup) return;
         if (saved.load() >= want) return;
