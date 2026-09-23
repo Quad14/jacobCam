@@ -59,6 +59,11 @@ HRESULT QcamMediaSource::CheckShutdown() const {
     return shutdown_ ? MF_E_SHUTDOWN : S_OK;
 }
 
+bool QcamMediaSource::IsShutdown() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutdown_;
+}
+
 HRESULT QcamMediaSource::CreateMediaType(IMFMediaType** out) const {
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -172,6 +177,35 @@ HRESULT QcamMediaSource::Initialize() {
                                        MFFrameSourceTypes_Color);
     if (FAILED(hr)) return hr;
 
+    // Undocumented, but the Frame Server client reads both off every stream
+    // during activation (confirmed via mftrace); leaving them unset may be
+    // read as "hidden" rather than defaulted to visible.
+    hr = stream_attributes_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 0);
+    if (FAILED(hr)) return hr;
+    hr = stream_attributes_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_HIDDEN, 0);
+    if (FAILED(hr)) return hr;
+
+    // The Frame Server queries this during activation, before ever starting
+    // the source, and appears to require it: without a sensor profile
+    // collection the camera activates but Start() fails with MF_E_SHUTDOWN.
+    // This camera has one fixed frame rate, so a single generic "normal
+    // speed" profile is enough; there is no high-frame-rate mode to declare.
+    {
+        ComPtr<IMFSensorProfileCollection> profiles;
+        ComPtr<IMFSensorProfile> profile;
+        hr = MFCreateSensorProfileCollection(&profiles);
+        if (FAILED(hr)) return hr;
+        hr = MFCreateSensorProfile(KSCAMERAPROFILE_Legacy, 0, nullptr, &profile);
+        if (FAILED(hr)) return hr;
+        hr = profile->AddProfileFilter(/*streamId=*/0, L"((RES==;FRT<=30,1;SUT==))");
+        if (FAILED(hr)) return hr;
+        hr = profiles->AddProfile(profile.Get());
+        if (FAILED(hr)) return hr;
+        hr = source_attributes_->SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION,
+                                            profiles.Get());
+        if (FAILED(hr)) return hr;
+    }
+
     stream_ = new (std::nothrow) QcamMediaStream();
     if (!stream_) return E_OUTOFMEMORY;
 
@@ -199,9 +233,13 @@ IFACEMETHODIMP QcamMediaSource::QueryInterface(REFIID riid, void** ppv) {
         *ppv = static_cast<IMFMediaSourceEx*>(this);
     } else if (riid == IID_IMFGetService) {
         *ppv = static_cast<IMFGetService*>(this);
+    } else if (riid == IID_IMFSampleAllocatorControl) {
+        *ppv = static_cast<IMFSampleAllocatorControl*>(this);
     } else if (riid == __uuidof(IKsControl)) {
         *ppv = static_cast<IKsControl*>(this);
     } else {
+        QCAM_LOGT("QcamMediaSource: interface {%08lx-...} not implemented",
+                  (unsigned long)riid.Data1);
         return E_NOINTERFACE;
     }
     AddRef();
@@ -334,8 +372,15 @@ IFACEMETHODIMP QcamMediaSource::Start(IMFPresentationDescriptor* pd,
         PropVariantClear(&start);
     }
 
+    if (FAILED(hr))
+        QCAM_LOGE("Camera::Start: queuing the new-stream event failed: 0x%08lx",
+                  static_cast<unsigned long>(hr));
+
     // The stream queues MEStreamStarted on its own queue.
     if (SUCCEEDED(hr)) hr = stream->Start();
+    if (FAILED(hr))
+        QCAM_LOGE("Camera::Start: stream failed to start: 0x%08lx",
+                  static_cast<unsigned long>(hr));
 
     stream->Release();
     return hr;
@@ -444,6 +489,38 @@ IFACEMETHODIMP QcamMediaSource::GetService(REFGUID service, REFIID riid, LPVOID*
         return QueryInterface(riid, ppv);
 
     return MF_E_UNSUPPORTED_SERVICE;
+}
+
+// --- IMFSampleAllocatorControl ---------------------------------------------
+
+IFACEMETHODIMP QcamMediaSource::SetDefaultAllocator(DWORD output_stream_id,
+                                                    IUnknown* allocator) {
+    if (output_stream_id != 0) return MF_E_INVALIDSTREAMNUMBER;
+
+    QcamMediaStream* stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        HRESULT hr = CheckShutdown();
+        if (FAILED(hr)) return hr;
+        stream = stream_;
+        if (stream) stream->AddRef();
+    }
+    if (!stream) return E_UNEXPECTED;
+    const HRESULT hr = stream->SetAllocator(allocator);
+    stream->Release();
+    return hr;
+}
+
+IFACEMETHODIMP QcamMediaSource::GetAllocatorUsage(DWORD output_stream_id,
+                                                  DWORD* input_stream_id,
+                                                  MFSampleAllocatorUsage* usage) {
+    if (!input_stream_id || !usage) return E_POINTER;
+    if (output_stream_id != 0) return MF_E_INVALIDSTREAMNUMBER;
+    // A source has no input streams; echo the output id as Microsoft's own
+    // virtual camera sample does.
+    *input_stream_id = output_stream_id;
+    *usage = MFSampleAllocatorUsage_UsesProvidedAllocator;
+    return S_OK;
 }
 
 // --- IKsControl ------------------------------------------------------------

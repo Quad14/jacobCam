@@ -112,6 +112,10 @@ Status CameraService::OpenAndStream(const ServiceOptions& options) {
     cfg.format     = options.format;
     cfg.out_width  = options.out_width;
     cfg.out_height = options.out_height;
+    // A short frame is padded with grey; one that ended almost at once is a
+    // solid grey frame, which an app shows as a flash. Drop them: the virtual
+    // camera repeats the previous frame instead.
+    cfg.emit_short_frames = false;
 
     QCAM_TRY(camera_.OpenFirst(cfg));
 

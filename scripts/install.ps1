@@ -215,8 +215,10 @@ if ($DriverOnly) {
 # ---------------------------------------------------------------------------
 if (-not $NoVirtualCamera) {
     Write-Step "Registering the virtual camera"
-    & regsvr32.exe /s $vcam
-    if ($LASTEXITCODE -ne 0) { throw "regsvr32 failed with exit code $LASTEXITCODE" }
+    # regsvr32 is a GUI-subsystem program: calling it with & neither waits for
+    # it nor sets $LASTEXITCODE, so start it explicitly and read its exit code.
+    $regsvr = Start-Process regsvr32.exe -ArgumentList '/s', "`"$vcam`"" -Wait -PassThru
+    if ($regsvr.ExitCode -ne 0) { throw "regsvr32 failed with exit code $($regsvr.ExitCode)" }
     Write-Host "  registered $vcam"
 
     # Done here, once, because it needs administrator rights and the service
