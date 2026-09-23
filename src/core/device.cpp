@@ -112,10 +112,7 @@ void Camera::Close() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     std::lock_guard<std::mutex> ctrl(ctrl_mutex_);
-    if (sensor_ && bridge_) {
-        sensor_->Stop(*bridge_);
-        bridge_->SetLed(false);
-    }
+    if (sensor_ && bridge_) sensor_->Stop(*bridge_);
     sensor_.reset();
     bridge_.reset();
     transport_.reset();
@@ -153,7 +150,6 @@ Status Camera::Start(FrameHandler handler) {
     if (Failed(st)) {
         bridge_->EnableIso(false);
         sensor_->Stop(*bridge_);
-        bridge_->SetLed(false);
         transport_->SetAltSetting(kAltIdle);
         return st;
     }
@@ -182,10 +178,11 @@ Status Camera::Stop() {
     // No callback can be in flight past this point.
     std::lock_guard<std::mutex> lock(mutex_);
     std::lock_guard<std::mutex> ctrl(ctrl_mutex_);
-    if (bridge_) {
-        bridge_->EnableIso(false);
-        bridge_->SetLed(false);
-    }
+    // No LED writes anywhere: on the V-UB2, writing 1 to the LED register
+    // (0x1445) wedges the bridge until the camera is replugged, streaming or
+    // not, and there is no LED fitted to drive. Writing 0 was harmless, but
+    // it does nothing either.
+    if (bridge_) bridge_->EnableIso(false);
     if (sensor_ && bridge_) sensor_->Stop(*bridge_);
     if (transport_) transport_->SetAltSetting(kAltIdle);
     handler_ = nullptr;
